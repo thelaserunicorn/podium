@@ -1,0 +1,131 @@
+package kubernetes
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/podium/podium/internal/application"
+	"github.com/podium/podium/internal/deployment"
+	"github.com/podium/podium/internal/storage"
+)
+
+// ImageLoader is the small surface area needed from the docker.Builder
+// after a successful build: push the freshly-built image into the
+// kind cluster. Declared here (rather than reusing docker.Builder
+// directly) so the kubernetes package does not import the docker
+// package — the wiring in cmd/podium/main.go passes the builder.
+type ImageLoader interface {
+	LoadIntoKind(ctx context.Context, tag string) error
+}
+
+// Applier implements deployment.K8sApplier. It drives a single
+// deployment through DEPLOYING → STARTING → RUNNING against a real
+// kind cluster:
+//
+//  1. ensure the namespace exists
+//  2. apply the Deployment + Service
+//  3. push the image into the cluster (kind load)
+//  4. poll until readyReplicas == desiredReplicas (or timeout)
+//
+// On success the deployment is set to RUNNING and nil is returned.
+// On any failure a wrapped sentinel is returned; classifyReason in
+// the orchestrator translates that into the short reason string
+// persisted on the row.
+type Applier struct {
+	Client *Client
+	Store  *storage.Queries
+	App    AppReader
+	// Loader pushes the built image into the kind cluster. Optional —
+	// when nil, the load step is skipped (useful for tests).
+	Loader ImageLoader
+	// PollEvery is the readiness-poll interval. Default 2s.
+	PollEvery time.Duration
+	// ReadyTimeout caps the readiness poll. Default 5m.
+	ReadyTimeout time.Duration
+}
+
+// AppReader is the subset of application.Service that the Applier
+// needs. It is a real interface so tests can pass a fake without
+// depending on the application package's database plumbing.
+type AppReader interface {
+	Get(ctx context.Context, id, userID int64) (application.Application, error)
+}
+
+func (a *Applier) defaults() {
+	if a.PollEvery <= 0 {
+		a.PollEvery = 2 * time.Second
+	}
+	if a.ReadyTimeout <= 0 {
+		a.ReadyTimeout = 5 * time.Minute
+	}
+}
+
+// Apply is the deployment.K8sApplier entry point.
+func (a *Applier) Apply(ctx context.Context, deploymentID int64) error {
+	a.defaults()
+	d, err := a.Store.GetDeployment(ctx, deploymentID)
+	if err != nil {
+		return fmt.Errorf("kubernetes: load deployment %d: %w", deploymentID, err)
+	}
+	env, err := a.Store.GetEnvironment(ctx, d.EnvironmentID)
+	if err != nil {
+		return fmt.Errorf("%w: lookup environment: %v", deployment.ErrDeployFailed, err)
+	}
+	app, err := a.App.Get(ctx, d.ApplicationID, 0)
+	if err != nil {
+		return fmt.Errorf("kubernetes: load application %d: %w", d.ApplicationID, err)
+	}
+
+	if err := a.Client.EnsureNamespace(ctx, env.Namespace); err != nil {
+		return fmt.Errorf("%w: %v", deployment.ErrDeployFailed, err)
+	}
+
+	depName, err := a.Client.ApplyDeployment(ctx, &app, env.Namespace, d.Image, d.Replicas)
+	if err != nil {
+		return fmt.Errorf("%w: %v", deployment.ErrDeployFailed, err)
+	}
+	if err := a.Client.ApplyService(ctx, &app, env.Namespace); err != nil {
+		return fmt.Errorf("%w: %v", deployment.ErrDeployFailed, err)
+	}
+	if a.Loader != nil {
+		if err := a.Loader.LoadIntoKind(ctx, d.Image); err != nil {
+			return fmt.Errorf("%w: kind load: %v", deployment.ErrDeployFailed, err)
+		}
+	}
+
+	if err := a.Store.SetDeploymentStatus(ctx, deploymentID, storage.StatusStarting, ""); err != nil {
+		return fmt.Errorf("kubernetes: set STARTING: %w", err)
+	}
+
+	return a.waitReady(ctx, deploymentID, env.Namespace, depName, d.Replicas)
+}
+
+func (a *Applier) waitReady(ctx context.Context, deploymentID int64, namespace, depName string, replicas int) error {
+	pollCtx, cancel := context.WithTimeout(ctx, a.ReadyTimeout)
+	defer cancel()
+	ticker := time.NewTicker(a.PollEvery)
+	defer ticker.Stop()
+
+	// Scale-to-zero flips to RUNNING as soon as the Deployment object
+	// exists (DECISIONS.md B). Anything else polls.
+	if replicas == 0 {
+		return a.Store.SetDeploymentStatus(ctx, deploymentID, storage.StatusRunning, "")
+	}
+
+	for {
+		cur, des, err := a.Client.CurrentReplicas(pollCtx, namespace, depName)
+		if err != nil {
+			return fmt.Errorf("%w: %v", deployment.ErrDeployFailed, err)
+		}
+		if cur >= des {
+			return a.Store.SetDeploymentStatus(ctx, deploymentID, storage.StatusRunning, "")
+		}
+		select {
+		case <-pollCtx.Done():
+			_ = a.Store.SetDeploymentStatus(ctx, deploymentID, storage.StatusFailed, "readiness_timeout")
+			return fmt.Errorf("%w: %v", deployment.ErrReadinessTimeout, pollCtx.Err())
+		case <-ticker.C:
+		}
+	}
+}

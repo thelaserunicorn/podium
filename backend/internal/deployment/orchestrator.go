@@ -44,7 +44,9 @@ type Orchestrator struct {
 // deployment is marked FAILED with a short reason string per
 // DECISIONS.md B.
 type Timeouts struct {
-	Build time.Duration
+	Build     time.Duration // clone + docker build (M2)
+	Deploy    time.Duration // EnsureNamespace + ApplyDeployment + ApplyService + kind-load (M3)
+	Readiness time.Duration // readyReplicas poll loop (M3)
 }
 
 // K8sApplier is the M3 hook. When nil, the orchestrator stops at BUILT
@@ -58,6 +60,12 @@ type K8sApplier interface {
 func NewOrchestrator(store *storage.Queries, builder docker.Builder, fetcher docker.SourceFetcher, workdir string, timeouts Timeouts, k8s K8sApplier) *Orchestrator {
 	if timeouts.Build == 0 {
 		timeouts.Build = 15 * time.Minute
+	}
+	if timeouts.Deploy == 0 {
+		timeouts.Deploy = 2 * time.Minute
+	}
+	if timeouts.Readiness == 0 {
+		timeouts.Readiness = 5 * time.Minute
 	}
 	return &Orchestrator{
 		store:    store,
@@ -79,6 +87,18 @@ var ErrAlreadyRunning = errors.New("deployment already running")
 // underlying docker failure. Underlying error is the docker.ErrBuildFailed
 // (or its wrapper from the SourceFetcher) and is safe to surface.
 var ErrBuildFailed = errors.New("build failed")
+
+// ErrDeployFailed wraps the kubernetes package's failure modes (ensure
+// namespace, apply Deployment / Service, kind load). The kubernetes
+// applier returns errors that errors.Is-match this sentinel; classifyReason
+// translates it into the "deploy_failed" reason string persisted on the
+// row.
+var ErrDeployFailed = errors.New("deploy failed")
+
+// ErrReadinessTimeout wraps the readiness poll deadline. The applier
+// returns errors that errors.Is-match this sentinel when readyReplicas
+// never reaches desiredReplicas within Timeouts.Readiness.
+var ErrReadinessTimeout = errors.New("readiness timeout")
 
 // SourceDir returns the path where this orchestrator would clone the
 // given app's source. Exposed so tests can assert on layout.
@@ -162,20 +182,21 @@ func (o *Orchestrator) runLocked(ctx context.Context, deploymentID, appID int64,
 		return nil
 	}
 
-	// 4. DEPLOYING → STARTING → RUNNING via the M3 hook. The hook is
-	// responsible for polling readiness and surfacing failures as
-	// errors. The orchestrator translates the result into the right
-	// status update.
+	// 4. DEPLOYING → STARTING → RUNNING via the M3 hook. The hook
+	// owns the per-stage status writes (Deploying → Starting →
+	// Running) and the readiness poll; the orchestrator only stamps
+	// DEPLOYING before delegating and translates failures into
+	// FAILED via fail().
 	if err := o.store.SetDeploymentStatus(ctx, deploymentID, storage.StatusDeploying, ""); err != nil {
 		return err
 	}
-	if err := o.k8s.Apply(ctx, deploymentID); err != nil {
+	deployCtx, cancel := context.WithTimeout(ctx, o.timeouts.Deploy)
+	defer cancel()
+	if err := o.k8s.Apply(deployCtx, deploymentID); err != nil {
 		o.fail(ctx, deploymentID, err)
 		return err
 	}
-	if err := o.store.SetDeploymentStatus(ctx, deploymentID, storage.StatusStarting, ""); err != nil {
-		return err
-	}
+	// Applier flipped to RUNNING on success; nothing else to do.
 	return nil
 }
 
@@ -197,6 +218,10 @@ func classifyReason(err error) string {
 	switch {
 	case errors.Is(err, ErrBuildFailed), errors.Is(err, docker.ErrBuildFailed):
 		return "build_failed"
+	case errors.Is(err, ErrDeployFailed):
+		return "deploy_failed"
+	case errors.Is(err, ErrReadinessTimeout):
+		return "readiness_timeout"
 	case errors.Is(err, context.DeadlineExceeded):
 		return "build_timeout"
 	default:

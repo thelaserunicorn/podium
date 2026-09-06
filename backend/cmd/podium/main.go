@@ -21,6 +21,7 @@ import (
 	"github.com/podium/podium/internal/auth"
 	"github.com/podium/podium/internal/deployment"
 	"github.com/podium/podium/internal/docker"
+	"github.com/podium/podium/internal/kubernetes"
 	"github.com/podium/podium/internal/storage"
 )
 
@@ -74,10 +75,30 @@ func run() error {
 		fetcher = docker.NewGitSourceFetcher()
 	}
 	queries := storage.NewQueries(db)
+
+	// K8s applier: try to connect to a cluster (kind on the host).
+	// Failures are non-fatal so the dashboard still serves; deploys
+	// after BUILT then mark FAILED with "deploy_failed: <kubeconfig
+	// error>" (mirrors the docker NopBuilder fallback in M2).
+	var k8sApplier deployment.K8sApplier
+	k8sClient, k8sErr := kubernetes.New()
+	if k8sErr != nil {
+		logger.Warn("kubernetes client unavailable; deploy endpoints will stop at BUILT", "err", k8sErr)
+		k8sApplier = kubernetes.NopApplier{Err: k8sErr}
+	} else {
+		logger.Info("kubernetes client connected", "source", k8sClient.Source)
+		k8sApplier = &kubernetes.Applier{
+			Client: k8sClient,
+			Store:  queries,
+			App:    appSvc,
+			Loader: deployBuilder,
+		}
+	}
+
 	orch := deployment.NewOrchestrator(
 		queries, deployBuilder, fetcher, sourceRoot,
 		deployment.Timeouts{Build: 15 * time.Minute},
-		nil, // k8s applier — wired in M3
+		k8sApplier,
 	)
 
 	// HTTP wiring.

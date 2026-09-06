@@ -344,6 +344,26 @@ func (q *Queries) EnvironmentIDByNamespace(ctx context.Context, namespace string
 	return id, err
 }
 
+// GetEnvironment loads an environment row by id, returning sql.ErrNoRows
+// for unknown ids. Used by the kubernetes.Applier to resolve a
+// deployment's envID into the namespace string.
+func (q *Queries) GetEnvironment(ctx context.Context, id int64) (*Environment, error) {
+	if q == nil || q.db == nil {
+		return nil, errors.New("storage: queries not initialised")
+	}
+	row := q.db.QueryRowContext(ctx,
+		`SELECT id, name, namespace, created_at FROM environments WHERE id = ?`, id)
+	var e Environment
+	var createdAt string
+	if err := row.Scan(&e.ID, &e.Name, &e.Namespace, &createdAt); err != nil {
+		return nil, err
+	}
+	if t, err := parseTS(createdAt); err == nil {
+		e.CreatedAt = t
+	}
+	return &e, nil
+}
+
 // EnsureEnvironment inserts a row for a custom Kubernetes namespace
 // (DECISIONS.md C) if one does not already exist, then returns the
 // id. The columns `name` and `namespace` are both UNIQUE — for custom

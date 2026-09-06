@@ -177,6 +177,9 @@ func TestClassifyReason(t *testing.T) {
 		{nil, ""},
 		{docker.ErrBuildFailed, "build_failed"},
 		{fmt.Errorf("%w: bad", docker.ErrBuildFailed), "build_failed"},
+		{ErrDeployFailed, "deploy_failed"},
+		{fmt.Errorf("%w: bad", ErrDeployFailed), "deploy_failed"},
+		{ErrReadinessTimeout, "readiness_timeout"},
 		{context.DeadlineExceeded, "build_timeout"},
 		{errors.New("something"), "something"},
 	}
