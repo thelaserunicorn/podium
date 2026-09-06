@@ -81,7 +81,7 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	app, err := h.apps.Get(r.Context(), user.ID, appID)
+	app, err := h.apps.Get(r.Context(), appID, user.ID)
 	if err != nil {
 		if errors.Is(err, application.ErrNotFound) {
 			writeJSONError(w, http.StatusNotFound, "application not found")
@@ -200,7 +200,7 @@ func (h *DeploymentHandler) GetDeployment(w http.ResponseWriter, r *http.Request
 		return
 	}
 	// Authorize: deployment belongs to one of the caller's apps.
-	app, err := h.apps.Get(r.Context(), user.ID, d.ApplicationID)
+	app, err := h.apps.Get(r.Context(), d.ApplicationID, user.ID)
 	if err != nil {
 		writeJSONError(w, http.StatusNotFound, "deployment not found")
 		return
@@ -222,7 +222,7 @@ func (h *DeploymentHandler) ListDeployments(w http.ResponseWriter, r *http.Reque
 		writeJSONError(w, http.StatusBadRequest, "invalid application id")
 		return
 	}
-	if _, err := h.apps.Get(r.Context(), user.ID, appID); err != nil {
+	if _, err := h.apps.Get(r.Context(), appID, user.ID); err != nil {
 		if errors.Is(err, application.ErrNotFound) {
 			writeJSONError(w, http.StatusNotFound, "application not found")
 			return
@@ -271,7 +271,7 @@ func (h *DeploymentHandler) GetLogs(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusNotFound, "deployment not found")
 		return
 	}
-	if _, err := h.apps.Get(r.Context(), user.ID, d.ApplicationID); err != nil {
+	if _, err := h.apps.Get(r.Context(), d.ApplicationID, user.ID); err != nil {
 		writeJSONError(w, http.StatusNotFound, "deployment not found")
 		return
 	}

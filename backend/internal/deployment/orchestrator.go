@@ -180,6 +180,10 @@ func (o *Orchestrator) runLocked(ctx context.Context, deploymentID, appID int64,
 }
 
 func (o *Orchestrator) fail(ctx context.Context, deploymentID int64, cause error) {
+	// Always stamp the error into the log stream so the diagnostics
+	// panel has something to show even when the failure happened before
+	// Docker emitted any output (clone failure, kind load error, etc.).
+	_ = o.store.AppendLogLine(ctx, deploymentID, "[error] "+cause.Error())
 	reason := classifyReason(cause)
 	_ = o.store.SetDeploymentStatus(ctx, deploymentID, storage.StatusFailed, reason)
 }
