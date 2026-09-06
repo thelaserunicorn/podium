@@ -226,3 +226,133 @@ split_code "$(req POST /api/applications/$APP_ID/deploy '{}')"
 
 echo
 echo "All M1 + M2 smoke checks passed."
+
+# -------------------------------------------------------------------------
+# M3 — Kubernetes apply + live runtime state
+# -------------------------------------------------------------------------
+# Live cluster required: probe $KUBECONFIG reachability. When no cluster is
+# reachable, every M3 check is SKIP — the API surface (NopApplier path) was
+# already exercised by M2 (the deploy landed in FAILED with reason
+# `deploy_failed`). This mirrors M2's docker-fallback strategy.
+
+K8S_AVAILABLE=0
+if [[ -n ${KUBECONFIG:-} ]] && kubectl --kubeconfig "$KUBECONFIG" cluster-info >/dev/null 2>&1; then
+  K8S_AVAILABLE=1
+fi
+
+skip() { printf "  \033[33mSKIP\033[0m %s\n" "$1"; }
+
+if [[ $K8S_AVAILABLE -eq 0 ]]; then
+  echo
+  echo "== M3 smoke (skip — no reachable cluster) =="
+  skip "no KUBECONFIG / kubectl cluster-info failed; M3 live checks skipped"
+  echo
+  echo "All M1 + M2 smoke checks passed (M3 SKIPPED)."
+  exit 0
+fi
+
+# Re-login alice (jar was wiped at M2.9).
+rm -f "$JAR"
+split_code "$(req POST /api/auth/login '{"username":"alice","password":"alice-secret"}')"
+[[ $CODE == 200 ]] && pass "alice re-login for M3 -> 200" || fail "alice re-login $CODE: $BODY"
+
+echo
+echo "== M3 smoke =="
+
+# M3.1 /api/namespaces — at least the three defaults are listed.
+split_code "$(req GET /api/namespaces)"
+[[ $CODE == 200 ]] && pass "/namespaces -> 200" || fail "/namespaces $CODE: $BODY"
+for ns in podium-dev podium-staging podium-prod; do
+  echo "$BODY" | grep -q "\"namespace\":\"$ns\"" && pass "default namespace '$ns' listed" || fail "missing default namespace '$ns': $BODY"
+done
+
+# M3.2 /state on a known-bad namespace returns {available:false, namespace:podium-dev}
+# when no deployment exists yet — proves the endpoint is wired even pre-deploy.
+split_code "$(req GET /api/applications/$APP_ID/state?namespace=podium-dev)"
+[[ $CODE == 200 ]] && pass "/state pre-deploy -> 200" || fail "/state pre-deploy $CODE: $BODY"
+echo "$BODY" | grep -q '"available":true' && pass "/state reports available=true (cluster reachable)" || fail "/state available!=true: $BODY"
+
+# M3.3 deploy to podium-dev with 1 replica (smallest possible).
+split_code "$(req POST /api/applications/$APP_ID/deploy '{"namespace":"podium-dev","replicas":1}')"
+case $CODE in
+  201) pass "M3 deploy -> 201" ;;
+  409) fail "M3 deploy conflict — is another deploy still in-flight from a prior run? (409)" ;;
+  *)   fail "M3 deploy $CODE: $BODY" ;;
+esac
+DEP_ID=$(echo "$BODY" | python3 -c 'import sys,json; print(json.load(sys.stdin)["deployment"]["id"])')
+echo "  M3 deployment id = $DEP_ID"
+
+# M3.4 wait up to 120s for RUNNING.
+WAITED=0
+TERMINAL=""
+while [[ $WAITED -lt 120 ]]; do
+  split_code "$(req GET /api/deployments/$DEP_ID)"
+  STATUS=$(echo "$BODY" | python3 -c 'import sys,json; print(json.load(sys.stdin)["deployment"]["status"])')
+  case $STATUS in
+    RUNNING) TERMINAL=RUNNING; break ;;
+    FAILED)
+      REASON=$(echo "$BODY" | python3 -c 'import sys,json; print(json.load(sys.stdin)["deployment"].get("reason") or "")')
+      fail "M3 deploy FAILED after ${WAITED}s (reason=$REASON)"
+      ;;
+  esac
+  sleep 2
+  WAITED=$((WAITED+2))
+done
+if [[ $TERMINAL != "RUNNING" ]]; then
+  fail "M3 deploy $DEP_ID never reached RUNNING after ${WAITED}s (last=$STATUS)"
+fi
+pass "M3 deploy reached RUNNING in ${WAITED}s"
+
+# M3.5 /state should now show available=true, 1/1 replicas, ≥1 Running pod.
+split_code "$(req GET /api/applications/$APP_ID/state?namespace=podium-dev)"
+[[ $CODE == 200 ]] && pass "/state post-deploy -> 200" || fail "/state post-deploy $CODE: $BODY"
+echo "$BODY" | grep -q '"available":true' || fail "available!=true after RUNNING: $BODY"
+echo "$BODY" | grep -q '"current_replicas":1' || fail "current_replicas!=1: $BODY"
+echo "$BODY" | grep -q '"desired_replicas":1' || fail "desired_replicas!=1: $BODY"
+echo "$BODY" | grep -q '"phase":"Running"' || fail "no Running pod: $BODY"
+pass "/state shows available=true, 1/1 replicas, Running pod"
+
+# M3.6 concurrent deploy → 409 (existing rule).
+split_code "$(req POST /api/applications/$APP_ID/deploy '{"namespace":"podium-dev","replicas":1}')"
+[[ $CODE == 409 ]] && pass "concurrent M3 deploy -> 409" || fail "concurrent M3 got $CODE (expected 409): $BODY"
+
+# M3.7 custom namespace create-on-the-fly: DNS-1123 name, distinct from the
+# three defaults, and assert /state is queryable in the new namespace.
+CUSTOM_NS="alice-smoke-$(date +%s)"
+split_code "$(req POST /api/applications/$APP_ID/deploy "{\"namespace\":\"$CUSTOM_NS\",\"replicas\":1}")"
+case $CODE in
+  201) pass "custom-namespace deploy '$CUSTOM_NS' -> 201" ;;
+  409) fail "custom-namespace conflict — prior deploy still in-flight? (409)" ;;
+  *)   fail "custom-namespace deploy $CODE: $BODY" ;;
+esac
+CUSTOM_DEP=$(echo "$BODY" | python3 -c 'import sys,json; print(json.load(sys.stdin)["deployment"]["id"])')
+
+# M3.7a /namespaces now lists the custom one too.
+split_code "$(req GET /api/namespaces)"
+echo "$BODY" | grep -q "\"namespace\":\"$CUSTOM_NS\"" && pass "custom namespace '$CUSTOM_NS' appears in /namespaces" || fail "custom namespace missing: $BODY"
+
+# M3.7b wait for the custom-namespace deploy to RUNNING (smaller ready timeout).
+WAITED=0
+while [[ $WAITED -lt 120 ]]; do
+  split_code "$(req GET /api/deployments/$CUSTOM_DEP)"
+  STATUS=$(echo "$BODY" | python3 -c 'import sys,json; print(json.load(sys.stdin)["deployment"]["status"])')
+  case $STATUS in
+    RUNNING) break ;;
+    FAILED)
+      REASON=$(echo "$BODY" | python3 -c 'import sys,json; print(json.load(sys.stdin)["deployment"].get("reason") or "")')
+      fail "custom-namespace deploy FAILED (reason=$REASON)"
+      ;;
+  esac
+  sleep 2
+  WAITED=$((WAITED+2))
+done
+[[ $STATUS == "RUNNING" ]] && pass "custom-namespace deploy reached RUNNING in ${WAITED}s" || fail "custom-namespace never ran: $STATUS"
+
+# M3.7c /state scoped to the custom namespace.
+split_code "$(req GET /api/applications/$APP_ID/state?namespace=$CUSTOM_NS)"
+[[ $CODE == 200 ]] && pass "/state (custom ns) -> 200" || fail "/state (custom ns) $CODE: $BODY"
+echo "$BODY" | grep -q "\"namespace\":\"$CUSTOM_NS\"" && pass "/state scoped to '$CUSTOM_NS'" || fail "/state wrong namespace: $BODY"
+echo "$BODY" | grep -q '"available":true' && pass "/state available=true in custom ns" || fail "/state available!=true in custom ns"
+
+echo
+echo "All M1 + M2 + M3 smoke checks passed."
