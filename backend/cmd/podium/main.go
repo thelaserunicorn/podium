@@ -107,6 +107,12 @@ func run() error {
 	api.MountApplications(mux, application.NewHandler(appSvc))
 	api.NewDeploymentHandler(queries, appSvc, orch, logger).Mount(mux)
 	api.NewAdminHandler(authSvc).Mount(mux)
+	if k8sClient != nil {
+		api.NewK8sHandler(queries, appSvc, k8sClient, logger).Mount(mux)
+	} else {
+		// Still mount with a nil client so /state returns {available:false}.
+		api.NewK8sHandler(queries, appSvc, nil, logger).Mount(mux)
+	}
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
 		_, _ = w.Write([]byte(`{"status":"ok"}`))

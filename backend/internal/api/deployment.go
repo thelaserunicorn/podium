@@ -119,11 +119,21 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 
 	envID, err := h.store.EnvironmentIDByNamespace(r.Context(), namespace)
 	if err != nil {
-		// Namespace doesn't exist yet. For M2 we only support the
-		// three defaults; the frontend should never send anything
-		// else. Custom namespaces land in M3.
-		writeJSONError(w, http.StatusBadRequest, "unknown namespace "+namespace)
-		return
+		if !errors.Is(err, sql.ErrNoRows) {
+			h.logger.Error("lookup environment", "err", err)
+			writeJSONError(w, http.StatusInternalServerError, "internal_error")
+			return
+		}
+		// DECISIONS.md C: the user typed a custom namespace; create it
+		// on demand. The actual Kubernetes namespace is created by the
+		// orchestrator's applier when it runs; here we just record the
+		// SQLite row so ListDeployments / state lookups can join on it.
+		envID, err = h.store.EnsureEnvironment(r.Context(), namespace)
+		if err != nil {
+			h.logger.Error("create environment", "err", err, "namespace", namespace)
+			writeJSONError(w, http.StatusInternalServerError, "internal_error")
+			return
+		}
 	}
 
 	active, err := h.store.HasActiveDeployment(r.Context(), appID, envID)

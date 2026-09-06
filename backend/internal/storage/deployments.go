@@ -344,6 +344,26 @@ func (q *Queries) EnvironmentIDByNamespace(ctx context.Context, namespace string
 	return id, err
 }
 
+// GetEnvironmentByNamespace returns the full Environment row for a
+// namespace, or sql.ErrNoRows if no such row exists. Used by the API
+// layer to translate a kube namespace string into the env id + label.
+func (q *Queries) GetEnvironmentByNamespace(ctx context.Context, namespace string) (*Environment, error) {
+	if q == nil || q.db == nil {
+		return nil, errors.New("storage: queries not initialised")
+	}
+	row := q.db.QueryRowContext(ctx,
+		`SELECT id, name, namespace, created_at FROM environments WHERE namespace = ?`, namespace)
+	var e Environment
+	var createdAt string
+	if err := row.Scan(&e.ID, &e.Name, &e.Namespace, &createdAt); err != nil {
+		return nil, err
+	}
+	if t, err := parseTS(createdAt); err == nil {
+		e.CreatedAt = t
+	}
+	return &e, nil
+}
+
 // GetEnvironment loads an environment row by id, returning sql.ErrNoRows
 // for unknown ids. Used by the kubernetes.Applier to resolve a
 // deployment's envID into the namespace string.
