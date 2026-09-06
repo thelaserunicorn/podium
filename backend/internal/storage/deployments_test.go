@@ -218,6 +218,51 @@ func TestEnvironmentIDByNamespace(t *testing.T) {
 	}
 }
 
+func TestEnsureEnvironment_CreatesAndIdempotent(t *testing.T) {
+	q := newTestQueries(t)
+	ctx := context.Background()
+
+	id1, err := q.EnsureEnvironment(ctx, "alice-test")
+	if err != nil {
+		t.Fatalf("EnsureEnvironment: %v", err)
+	}
+	if id1 == 0 {
+		t.Fatal("expected non-zero id")
+	}
+	id2, err := q.EnsureEnvironment(ctx, "alice-test")
+	if err != nil {
+		t.Fatalf("EnsureEnvironment idempotent: %v", err)
+	}
+	if id1 != id2 {
+		t.Errorf("second call should return same id: got %d want %d", id2, id1)
+	}
+}
+
+func TestListEnvironments_IncludesDefaultsAndCustom(t *testing.T) {
+	q := newTestQueries(t)
+	ctx := context.Background()
+
+	if _, err := q.EnsureEnvironment(ctx, "alice-test"); err != nil {
+		t.Fatal(err)
+	}
+	list, err := q.ListEnvironments(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(list) < 4 { // 3 defaults + 1 custom
+		t.Fatalf("expected >= 4, got %d", len(list))
+	}
+	found := map[string]bool{}
+	for _, e := range list {
+		found[e.Namespace] = true
+	}
+	for _, ns := range []string{"podium-dev", "podium-staging", "podium-prod", "alice-test"} {
+		if !found[ns] {
+			t.Errorf("missing namespace %q in list", ns)
+		}
+	}
+}
+
 func TestApplicationNextVersion_Monotonic(t *testing.T) {
 	q := newTestQueries(t)
 	_, appID, _ := seedUserAppEnv(t, q)

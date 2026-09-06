@@ -47,6 +47,18 @@ type LogLine struct {
 	Line         string    `json:"line"`
 }
 
+// Environment is a row from the environments table. In Podium the
+// `namespace` column is the Kubernetes namespace string (DECISIONS.md
+// C); `name` is the human-friendly label ("Development", "Staging",
+// "Production") used only for the three defaults. Custom namespaces
+// created on demand (M3) have name == namespace.
+type Environment struct {
+	ID        int64     `json:"id"`
+	Name      string    `json:"name"`
+	Namespace string    `json:"namespace"`
+	CreatedAt time.Time `json:"created_at"`
+}
+
 // ErrDeploymentBusy is returned when a second deploy for the same app
 // is fired while one is already in-flight (DECISIONS.md B).
 var ErrDeploymentBusy = errors.New("deployment already in progress")
@@ -330,6 +342,50 @@ func (q *Queries) EnvironmentIDByNamespace(ctx context.Context, namespace string
 	var id int64
 	err := q.db.QueryRowContext(ctx, `SELECT id FROM environments WHERE namespace = ?`, namespace).Scan(&id)
 	return id, err
+}
+
+// EnsureEnvironment inserts a row for a custom Kubernetes namespace
+// (DECISIONS.md C) if one does not already exist, then returns the
+// id. The columns `name` and `namespace` are both UNIQUE — for custom
+// rows we set `name = namespace` so the UI's freeform entry doubles
+// as the displayed label.
+func (q *Queries) EnsureEnvironment(ctx context.Context, namespace string) (int64, error) {
+	if q == nil || q.db == nil {
+		return 0, errors.New("storage: queries not initialised")
+	}
+	if _, err := q.db.ExecContext(ctx,
+		`INSERT OR IGNORE INTO environments (name, namespace) VALUES (?, ?)`,
+		namespace, namespace); err != nil {
+		return 0, fmt.Errorf("storage: insert environment: %w", err)
+	}
+	return q.EnvironmentIDByNamespace(ctx, namespace)
+}
+
+// ListEnvironments returns every environment row, oldest first (so the
+// three default namespaces appear at the top of the UI list).
+func (q *Queries) ListEnvironments(ctx context.Context) ([]Environment, error) {
+	if q == nil || q.db == nil {
+		return nil, errors.New("storage: queries not initialised")
+	}
+	rows, err := q.db.QueryContext(ctx,
+		`SELECT id, name, namespace, created_at FROM environments ORDER BY id ASC`)
+	if err != nil {
+		return nil, fmt.Errorf("storage: list environments: %w", err)
+	}
+	defer rows.Close()
+	var out []Environment
+	for rows.Next() {
+		var e Environment
+		var createdAt string
+		if err := rows.Scan(&e.ID, &e.Name, &e.Namespace, &createdAt); err != nil {
+			return nil, fmt.Errorf("storage: scan environment: %w", err)
+		}
+		if t, err := parseTS(createdAt); err == nil {
+			e.CreatedAt = t
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
 }
 
 // ApplicationNextVersion bumps the per-application version counter
