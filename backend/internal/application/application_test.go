@@ -413,3 +413,98 @@ func TestDNS1123ValidatorMatchesK8s(t *testing.T) {
 // return int64 values directly to keep tests concise.
 func testUserA(ctx context.Context, svc *application.Service) int64 { return svc.UserAForTest(ctx) }
 func testUserB(ctx context.Context, svc *application.Service) int64 { return svc.UserBForTest(ctx) }
+
+// TestLatestStatuses_PicksLatestDeployment: dashboard enrichment must
+// return the freshest deployment for each app, never the oldest. The
+// test stands up its own sqlite + auth + application stack so the
+// Service.WithQueries wiring can be exercised end-to-end without
+// dragging in the orchestrator.
+func TestLatestStatuses_PicksLatestDeployment(t *testing.T) {
+	t.Parallel()
+	ctx := context.Background()
+
+	dir := t.TempDir()
+	db, err := storage.Open(ctx, filepath.Join(dir, "podium.db"), storage.Options{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	authSvc := auth.NewService(db)
+	if err := auth.SeedAdmin(ctx, db, "root", "root-password"); err != nil {
+		t.Fatal(err)
+	}
+	userA := mustSignup(t, authSvc, "alice", "alice@example.com", "alice-secret")
+	if err := authSvc.ApproveUser(ctx, userA.ID); err != nil {
+		t.Fatal(err)
+	}
+
+	q := storage.NewQueries(db)
+	appSvc := application.NewService(db).WithQueries(q)
+
+	appA, err := appSvc.Create(ctx, application.CreateInput{
+		Name:          uniqueName("a"),
+		RepositoryURL: "https://github.com/example/a",
+		ContainerPort: 8080,
+		UserID:        userA.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	appB, err := appSvc.Create(ctx, application.CreateInput{
+		Name:          uniqueName("b"),
+		RepositoryURL: "https://github.com/example/b",
+		ContainerPort: 8080,
+		UserID:        userA.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	var envID int64
+	if err := q.DB().QueryRowContext(ctx, `SELECT id FROM environments WHERE namespace = 'podium-dev'`).Scan(&envID); err != nil {
+		t.Fatal(err)
+	}
+
+	// appA: two deployments — old FAILED, new RUNNING.
+	old, err := q.CreateDeployment(ctx, appA.ID, envID, 1, 1, "a:v1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := q.SetDeploymentStatus(ctx, old, storage.StatusFailed, "boom"); err != nil {
+		t.Fatal(err)
+	}
+	new1, err := q.CreateDeployment(ctx, appA.ID, envID, 2, 1, "a:v2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := q.SetDeploymentStatus(ctx, new1, storage.StatusRunning, ""); err != nil {
+		t.Fatal(err)
+	}
+
+	out, err := appSvc.LatestStatuses(ctx, []int64{appA.ID, appB.ID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := out[appA.ID]; got.Status != storage.StatusRunning || got.Version != 2 {
+		t.Errorf("appA latest=%+v want RUNNING v2", got)
+	}
+	if _, ok := out[appB.ID]; ok {
+		t.Errorf("never-deployed appB should be absent from LatestStatuses")
+	}
+}
+
+// TestLatestStatuses_NilQueriesIsSafe: a Service constructed without
+// WithQueries returns an empty map rather than panicking, so callers
+// that haven't migrated (older tests, partial wiring) still work.
+func TestLatestStatuses_NilQueriesIsSafe(t *testing.T) {
+	t.Parallel()
+	ctx, _, appSvc := newCtx(t)
+	out, err := appSvc.LatestStatuses(ctx, []int64{1, 2, 3})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(out) != 0 {
+		t.Errorf("expected empty map without WithQueries, got %v", out)
+	}
+}

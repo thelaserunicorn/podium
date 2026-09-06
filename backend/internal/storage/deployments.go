@@ -314,6 +314,85 @@ func (q *Queries) LogLinesSince(ctx context.Context, deploymentID int64, since t
 	return out, rows.Err()
 }
 
+// LatestStatus is the status of the most recent deployment for a given
+// application — across all namespaces. Returned by LatestDeploymentStatuses
+// so the dashboard can show one badge per app without an N+1 roundtrip.
+type LatestStatus struct {
+	DeploymentID int64
+	Status       DeploymentStatus
+	Version      int
+	Namespace    string
+	CreatedAt    time.Time
+}
+
+// LatestDeploymentStatuses returns the status of the latest deployment
+// (by created_at, then id tiebreak) for each application in appIDs,
+// across all environments. An id with no deployments is omitted from
+// the map; callers treat that as "never deployed".
+//
+// Implemented as one SQLite query that joins each id to the row with
+// the maximum (created_at, id) tuple. Avoids the N+1 that per-app
+// ListDeployments would incur for a dashboard view.
+func (q *Queries) LatestDeploymentStatuses(ctx context.Context, appIDs []int64) (map[int64]LatestStatus, error) {
+	if q == nil || q.db == nil {
+		return nil, errors.New("storage: queries not initialised")
+	}
+	out := map[int64]LatestStatus{}
+	if len(appIDs) == 0 {
+		return out, nil
+	}
+
+	// Build the IN-list with placeholders; modernc.org/sqlite binds
+	// args positionally so we can hand-build the slice safely.
+	placeholders := make([]string, len(appIDs))
+	args := make([]any, 0, len(appIDs)+1)
+	for i, id := range appIDs {
+		placeholders[i] = "?"
+		args = append(args, id)
+	}
+	in := "application_id IN (" + strings.Join(placeholders, ",") + ")"
+
+	q1 := `
+		SELECT d.application_id, d.id, d.status, d.version, e.namespace, d.created_at
+		FROM deployments d
+		JOIN environments e ON e.id = d.environment_id
+		WHERE d.id = (
+			SELECT d2.id FROM deployments d2
+			WHERE d2.application_id = d.application_id
+			ORDER BY d2.created_at DESC, d2.id DESC
+			LIMIT 1
+		)
+		AND ` + in
+
+	rows, err := q.db.QueryContext(ctx, q1, args...)
+	if err != nil {
+		return nil, fmt.Errorf("storage: latest deployment statuses: %w", err)
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var (
+			appID, depID          int64
+			status, ns, createdAt string
+			version               int
+		)
+		if err := rows.Scan(&appID, &depID, &status, &version, &ns, &createdAt); err != nil {
+			return nil, fmt.Errorf("storage: scan latest status: %w", err)
+		}
+		ls := LatestStatus{
+			DeploymentID: depID,
+			Status:       DeploymentStatus(status),
+			Version:      version,
+			Namespace:    ns,
+		}
+		if t, err := parseTS(createdAt); err == nil {
+			ls.CreatedAt = t
+		}
+		out[appID] = ls
+	}
+	return out, rows.Err()
+}
+
 // LatestLogTimestamp returns the most recent log ts for the deployment,
 // or zero time if there are no log lines yet.
 func (q *Queries) LatestLogTimestamp(ctx context.Context, deploymentID int64) (time.Time, error) {

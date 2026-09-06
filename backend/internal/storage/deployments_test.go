@@ -277,4 +277,103 @@ func TestApplicationNextVersion_Monotonic(t *testing.T) {
 	}
 }
 
+func TestLatestDeploymentStatuses_PicksNewest(t *testing.T) {
+	q := newTestQueries(t)
+	ctx := context.Background()
+
+	// Two apps: appID with two deployments (old FAILED, new RUNNING),
+	// appID2 with one deployment in BUILDING. Both apps belong to
+	// alice so we only seed the user once.
+	res, err := q.db.ExecContext(ctx,
+		`INSERT INTO users (username, email, password_hash, role, status) VALUES (?, ?, ?, 'USER', 'APPROVED')`,
+		"alice", "alice@example.com", "x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	userID, _ := res.LastInsertId()
+
+	insertApp := func(name string) int64 {
+		res, err := q.db.ExecContext(ctx,
+			`INSERT INTO applications (user_id, name, repository_url, container_port) VALUES (?, ?, ?, ?)`,
+			userID, name, "https://github.com/x/"+name, 8080)
+		if err != nil {
+			t.Fatal(err)
+		}
+		id, _ := res.LastInsertId()
+		return id
+	}
+	appID := insertApp("my-api")
+	appID2 := insertApp("my-other")
+
+	var envID int64
+	if err := q.db.QueryRowContext(ctx, `SELECT id FROM environments WHERE namespace = 'podium-dev'`).Scan(&envID); err != nil {
+		t.Fatal(err)
+	}
+
+	// Two deployments for appID — older FAILED then newer RUNNING.
+	oldID, _ := q.CreateDeployment(ctx, appID, envID, 1, 1, "a:v1")
+	q.SetDeploymentStatus(ctx, oldID, StatusFailed, "boom")
+	newID, _ := q.CreateDeployment(ctx, appID, envID, 2, 1, "a:v2")
+	q.SetDeploymentStatus(ctx, newID, StatusRunning, "")
+
+	// One deployment for appID2 in BUILDING.
+	midID, _ := q.CreateDeployment(ctx, appID2, envID, 1, 1, "b:v1")
+	q.SetDeploymentStatus(ctx, midID, StatusBuilding, "")
+
+	out, err := q.LatestDeploymentStatuses(ctx, []int64{appID, appID2})
+	if err != nil {
+		t.Fatalf("LatestDeploymentStatuses: %v", err)
+	}
+	if got := out[appID]; got.Status != StatusRunning || got.Version != 2 {
+		t.Errorf("appID latest=%+v want RUNNING v2", got)
+	}
+	if got := out[appID2]; got.Status != StatusBuilding || got.Version != 1 {
+		t.Errorf("appID2 latest=%+v want BUILDING v1", got)
+	}
+}
+
+func TestLatestDeploymentStatuses_OmitsNeverDeployed(t *testing.T) {
+	q := newTestQueries(t)
+	_, appID, envID := seedUserAppEnv(t, q)
+	ctx := context.Background()
+
+	id, _ := q.CreateDeployment(ctx, appID, envID, 1, 1, "a:v1")
+	q.SetDeploymentStatus(ctx, id, StatusBuilding, "")
+
+	// 999 has no deployments; should be absent from the map.
+	out, err := q.LatestDeploymentStatuses(ctx, []int64{appID, 999})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := out[999]; ok {
+		t.Errorf("never-deployed id should be absent")
+	}
+	if _, ok := out[appID]; !ok {
+		t.Errorf("deployed id should be present")
+	}
+}
+
+func TestLatestDeploymentStatuses_CrossNamespace(t *testing.T) {
+	q := newTestQueries(t)
+	_, appID, envID := seedUserAppEnv(t, q)
+	ctx := context.Background()
+
+	// Ensure a second namespace and deploy to both — latest should
+	// be the one in podium-staging regardless of id ordering.
+	stagingID, _ := q.EnsureEnvironment(ctx, "podium-staging")
+	id1, _ := q.CreateDeployment(ctx, appID, envID, 1, 1, "a:v1")
+	q.SetDeploymentStatus(ctx, id1, StatusFailed, "boom")
+	id2, _ := q.CreateDeployment(ctx, appID, stagingID, 2, 1, "a:v2")
+	q.SetDeploymentStatus(ctx, id2, StatusRunning, "")
+
+	out, err := q.LatestDeploymentStatuses(ctx, []int64{appID})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got := out[appID]
+	if got.Status != StatusRunning || got.Version != 2 || got.Namespace != "podium-staging" {
+		t.Errorf("latest=%+v want RUNNING v2 podium-staging", got)
+	}
+}
+
 func zeroTime() (t sql.NullTime) { return }

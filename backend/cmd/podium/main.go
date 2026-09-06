@@ -58,7 +58,11 @@ func run() error {
 	}
 
 	authSvc := auth.NewService(db)
-	appSvc := application.NewService(db)
+	queries := storage.NewQueries(db)
+	// appSvc holds the Queries handle so the dashboard can render the
+	// latest deployment status beside each application. The
+	// orchestrator also receives `queries`.
+	appSvc := application.NewService(db).WithQueries(queries)
 
 	// Deployment pipeline: docker client (real) + orchestrator. The
 	// real K8sApplier lands in M3; in M2 the orchestrator stops at
@@ -74,7 +78,6 @@ func run() error {
 		deployBuilder = builder
 		fetcher = docker.NewGitSourceFetcher()
 	}
-	queries := storage.NewQueries(db)
 
 	// K8s applier: try to connect to a cluster (kind on the host).
 	// Failures are non-fatal so the dashboard still serves; deploys

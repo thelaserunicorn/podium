@@ -7,6 +7,8 @@ import (
 	"fmt"
 	"strings"
 	"time"
+
+	"github.com/podium/podium/internal/storage"
 )
 
 // Application is the in-memory representation of a row in the applications
@@ -45,7 +47,8 @@ type UpdateInput struct {
 // Service is the public entry point for the application package.
 type Service struct {
 	db        *sql.DB
-	testUsers *testUserIDs // see WithUsers — nil in production
+	queries   *storage.Queries // optional; populated by WithQueries for dashboard status lookups
+	testUsers *testUserIDs     // see WithUsers — nil in production
 }
 
 // testUserIDs holds two known user ids used only by application_test.go.
@@ -56,6 +59,16 @@ type testUserIDs struct {
 
 // NewService wires the Service against the Podium database handle.
 func NewService(db *sql.DB) *Service { return &Service{db: db} }
+
+// WithQueries returns a copy of the Service that holds a *storage.Queries
+// reference. The handler uses this to enrich List responses with the
+// latest deployment status per app (dashboard badges). Production code
+// passes the same Queries that the orchestrator uses.
+func (s *Service) WithQueries(q *storage.Queries) *Service {
+	clone := *s
+	clone.queries = q
+	return &clone
+}
 
 // WithUsers returns a copy of the Service that knows about two user ids.
 // Tests use this to drive cross-user scenarios without depending on the
@@ -178,6 +191,17 @@ func (s *Service) List(ctx context.Context, userID int64) ([]Application, error)
 		out = append(out, a)
 	}
 	return out, rows.Err()
+}
+
+// LatestStatuses returns a map[applicationID] -> LatestStatus for the
+// supplied app ids, used by the dashboard to render status badges.
+// Returns an empty map (and no error) when the service was constructed
+// without WithQueries — older callers and tests don't need it.
+func (s *Service) LatestStatuses(ctx context.Context, appIDs []int64) (map[int64]storage.LatestStatus, error) {
+	if s.queries == nil || len(appIDs) == 0 {
+		return map[int64]storage.LatestStatus{}, nil
+	}
+	return s.queries.LatestDeploymentStatuses(ctx, appIDs)
 }
 
 // Update applies a partial update and bumps Version by 1.

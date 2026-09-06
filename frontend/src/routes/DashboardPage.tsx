@@ -1,9 +1,18 @@
-import { useEffect, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { Layers, Plus } from "lucide-react";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
+
+interface LatestStatus {
+  deployment_id: number;
+  status: "QUEUED" | "BUILDING" | "BUILT" | "DEPLOYING" | "STARTING" | "RUNNING" | "FAILED";
+  version: number;
+  namespace: string;
+  created_at: string;
+}
 
 interface Application {
   id: number;
@@ -12,6 +21,7 @@ interface Application {
   container_port: number;
   version: number;
   updated_at: string;
+  latest_status?: LatestStatus | null;
 }
 
 export function DashboardPage() {
@@ -28,6 +38,19 @@ export function DashboardPage() {
       }
     })();
   }, []);
+
+  // Derive running/failed totals across all apps. An app with no
+  // latest_status (never deployed) is not counted in either bucket.
+  const { running, failed } = useMemo(() => {
+    let running = 0;
+    let failed = 0;
+    for (const a of apps ?? []) {
+      const s = a.latest_status?.status;
+      if (s === "RUNNING") running++;
+      else if (s === "FAILED") failed++;
+    }
+    return { running, failed };
+  }, [apps]);
 
   return (
     <div className="space-y-6">
@@ -48,8 +71,16 @@ export function DashboardPage() {
 
       <div className="grid grid-cols-1 gap-4 sm:grid-cols-3">
         <Stat label="Applications" value={apps === null ? "—" : String(apps.length)} />
-        <Stat label="Running" value="—" hint="wires up in M3" />
-        <Stat label="Failed" value="—" hint="wires up in M3" />
+        <Stat
+          label="Running"
+          value={apps === null ? "—" : String(running)}
+          hint={apps === null ? undefined : "Latest deployment status across apps"}
+        />
+        <Stat
+          label="Failed"
+          value={apps === null ? "—" : String(failed)}
+          hint={apps === null ? undefined : "Latest deployment status across apps"}
+        />
       </div>
 
       <Card>
@@ -80,13 +111,16 @@ export function DashboardPage() {
             <ul className="divide-y divide-border">
               {apps.map((a) => (
                 <li key={a.id} className="flex items-center justify-between py-3">
-                  <div>
+                  <div className="flex items-center gap-2">
                     <Link to={`/apps/${a.id}`} className="text-sm font-medium hover:underline">
                       {a.name}
                     </Link>
-                    <p className="text-xs text-muted-foreground">{a.repository_url}</p>
+                    {a.latest_status && <StatusBadge status={a.latest_status.status} />}
                   </div>
-                  <span className="text-xs text-muted-foreground">v{a.version}</span>
+                  <div className="flex items-center gap-3 text-xs text-muted-foreground">
+                    {a.latest_status?.namespace && <span>{a.latest_status.namespace}</span>}
+                    <span>v{a.version}</span>
+                  </div>
                 </li>
               ))}
             </ul>
@@ -95,6 +129,22 @@ export function DashboardPage() {
       </Card>
     </div>
   );
+}
+
+function StatusBadge({ status }: { status: LatestStatus["status"] }) {
+  const variant =
+    status === "RUNNING"
+      ? "default"
+      : status === "FAILED"
+        ? "destructive"
+        : status === "QUEUED" ||
+            status === "BUILDING" ||
+            status === "BUILT" ||
+            status === "DEPLOYING" ||
+            status === "STARTING"
+          ? "secondary"
+          : "outline";
+  return <Badge variant={variant}>{status.toLowerCase()}</Badge>;
 }
 
 function Stat({ label, value, hint }: { label: string; value: string; hint?: string }) {

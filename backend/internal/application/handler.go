@@ -7,6 +7,7 @@ import (
 	"strconv"
 
 	"github.com/podium/podium/internal/auth"
+	"github.com/podium/podium/internal/storage"
 )
 
 // Handler exposes the application REST endpoints. The handler depends on
@@ -21,15 +22,32 @@ type Handler struct {
 func NewHandler(svc *Service) *Handler { return &Handler{svc: svc} }
 
 // ApplicationDTO is the JSON-safe representation of an Application.
+//
+// `latest_status` is the deployment status of the most recent deploy
+// across all namespaces, or null when the app has never been deployed.
+// The dashboard uses it for the per-app badge and the Running/Failed
+// count cards (so they reflect reality, not the M3 placeholder).
 type ApplicationDTO struct {
-	ID            int64  `json:"id"`
-	UserID        int64  `json:"user_id"`
-	Name          string `json:"name"`
-	RepositoryURL string `json:"repository_url"`
-	ContainerPort int    `json:"container_port"`
-	Version       int    `json:"version"`
-	CreatedAt     string `json:"created_at"`
-	UpdatedAt     string `json:"updated_at"`
+	ID            int64                `json:"id"`
+	UserID        int64                `json:"user_id"`
+	Name          string               `json:"name"`
+	RepositoryURL string               `json:"repository_url"`
+	ContainerPort int                  `json:"container_port"`
+	Version       int                  `json:"version"`
+	CreatedAt     string               `json:"created_at"`
+	UpdatedAt     string               `json:"updated_at"`
+	LatestStatus  *DeploymentStatusDTO `json:"latest_status,omitempty"`
+}
+
+// DeploymentStatusDTO is a minimal, dashboard-friendly snapshot of the
+// most recent deployment for an app. It omits the long log field the
+// full Deployment row carries.
+type DeploymentStatusDTO struct {
+	DeploymentID int64  `json:"deployment_id"`
+	Status       string `json:"status"`
+	Version      int    `json:"version"`
+	Namespace    string `json:"namespace"`
+	CreatedAt    string `json:"created_at"`
 }
 
 func toDTO(a Application) ApplicationDTO {
@@ -42,6 +60,16 @@ func toDTO(a Application) ApplicationDTO {
 		Version:       a.Version,
 		CreatedAt:     a.CreatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
 		UpdatedAt:     a.UpdatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
+	}
+}
+
+func statusDTO(ls storage.LatestStatus) DeploymentStatusDTO {
+	return DeploymentStatusDTO{
+		DeploymentID: ls.DeploymentID,
+		Status:       string(ls.Status),
+		Version:      ls.Version,
+		Namespace:    ls.Namespace,
+		CreatedAt:    ls.CreatedAt.UTC().Format("2006-01-02T15:04:05.000Z"),
 	}
 }
 
@@ -108,8 +136,31 @@ func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	out := make([]ApplicationDTO, 0, len(apps))
-	for _, a := range apps {
-		out = append(out, toDTO(a))
+	if len(apps) > 0 {
+		// Enrich each app with the latest deployment status so the
+		// dashboard can render running/failed counts and per-row
+		// badges without an extra round-trip per app.
+		ids := make([]int64, len(apps))
+		for i, a := range apps {
+			ids[i] = a.ID
+		}
+		statuses, err := h.svc.LatestStatuses(r.Context(), ids)
+		if err != nil {
+			writeError(w, http.StatusInternalServerError, "internal_error", "could not load latest statuses")
+			return
+		}
+		for _, a := range apps {
+			dto := toDTO(a)
+			if ls, ok := statuses[a.ID]; ok {
+				sdto := statusDTO(ls)
+				dto.LatestStatus = &sdto
+			}
+			out = append(out, dto)
+		}
+	} else {
+		for _, a := range apps {
+			out = append(out, toDTO(a))
+		}
 	}
 	writeJSON(w, http.StatusOK, map[string]any{"applications": out})
 }

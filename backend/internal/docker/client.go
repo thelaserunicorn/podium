@@ -68,6 +68,13 @@ func (c *Client) Build(ctx context.Context, dir, tag string, sink LogSink) error
 		Dockerfile:  "Dockerfile",
 		Remove:      true,
 		ForceRemove: true,
+		// BuildKit is required for Dockerfile features the legacy
+		// builder doesn't support, e.g. `COPY --chmod=…` (the error
+		// message users hit: "the --chmod option requires BuildKit").
+		// The Docker daemon selects BuildKit when Version = "2" and
+		// the daemon supports it; older daemons fall back to the
+		// legacy builder rather than failing the request.
+		Version: build.BuilderBuildKit,
 	}
 
 	resp, err := c.engine.ImageBuild(ctx, bytes.NewReader(tarBuf.Bytes()), opts)

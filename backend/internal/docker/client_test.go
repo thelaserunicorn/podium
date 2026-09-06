@@ -204,6 +204,30 @@ func TestClient_Build_DetectsErrorDetailInBody(t *testing.T) {
 	}
 }
 
+// TestClient_Build_RequestsBuildKit: Build must always request
+// BuilderBuildKit so that Dockerfiles using BuildKit-only syntax
+// (`COPY --chmod=…`, `RUN --mount=…`, heredocs, etc.) build
+// successfully. Without this, the daemon returns
+// "the --chmod option requires BuildKit" for any modern Dockerfile.
+func TestClient_Build_RequestsBuildKit(t *testing.T) {
+	engine := &fakeEngine{}
+	c, err := NewClient(engine, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "Dockerfile"), []byte("FROM scratch\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.Build(context.Background(), dir, "x:v1", NopSink{}); err != nil {
+		t.Fatal(err)
+	}
+	if engine.buildReq.Version != build.BuilderBuildKit {
+		t.Errorf("ImageBuildOptions.Version=%q want %q (BuildKit must be requested)",
+			engine.buildReq.Version, build.BuilderBuildKit)
+	}
+}
+
 func TestClient_LoadIntoKind_UsesRunner(t *testing.T) {
 	engine := &fakeEngine{}
 	r := &fakeRunner{response: "loaded\n"}
