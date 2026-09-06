@@ -29,12 +29,12 @@ import (
 // M3 work (kubernetes apply + readiness poll) plugs into the
 // K8sApplier hook without changing the orchestrator's shape.
 type Orchestrator struct {
-	store     *storage.Queries
-	builder   docker.Builder
-	fetcher   docker.SourceFetcher
-	workdir   string // root for cloned sources (e.g. /var/lib/podium/sources)
-	timeouts  Timeouts
-	k8s       K8sApplier // nil in M2; orchestrator stops at BUILT
+	store    *storage.Queries
+	builder  docker.Builder
+	fetcher  docker.SourceFetcher
+	workdir  string // root for cloned sources (e.g. /var/lib/podium/sources)
+	timeouts Timeouts
+	k8s      K8sApplier // nil in M2; orchestrator stops at BUILT
 
 	mu     sync.Mutex
 	active map[int64]context.CancelFunc // deploymentID → cancel

@@ -65,9 +65,9 @@ func (c *Client) Build(ctx context.Context, dir, tag string, sink LogSink) error
 	}
 
 	opts := build.ImageBuildOptions{
-		Tags:       []string{tag},
-		Dockerfile: "Dockerfile",
-		Remove:     true,
+		Tags:        []string{tag},
+		Dockerfile:  "Dockerfile",
+		Remove:      true,
 		ForceRemove: true,
 	}
 

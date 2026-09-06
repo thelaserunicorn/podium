@@ -51,8 +51,8 @@ type fakeFetcher struct {
 }
 
 type fetchCall struct {
-	url    string
-	dest   string
+	url  string
+	dest string
 }
 
 func (f *fakeFetcher) Fetch(_ context.Context, repoURL, destDir string) error {

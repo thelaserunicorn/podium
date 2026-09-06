@@ -21,7 +21,7 @@ import (
 
 // slowBuilder blocks until released or ctx cancels.
 type slowBuilder struct {
-	mu      sync.Mutex
+	mu       sync.Mutex
 	released bool
 }
 
@@ -70,11 +70,11 @@ func (errBuilder) LoadIntoKind(context.Context, string) error { return nil }
 // and the orchestrator-builder slot so tests can swap in a custom
 // builder.
 type fixture struct {
-	mux      http.Handler
-	store    *storage.Queries
-	cookie   string
-	aliceID  int64
-	appID    int64
+	mux     http.Handler
+	store   *storage.Queries
+	cookie  string
+	aliceID int64
+	appID   int64
 
 	builderMu sync.Mutex
 	builder   docker.Builder
@@ -333,6 +333,7 @@ func jsonNumber(i int64) string {
 	b, _ := json.Marshal(i)
 	return string(b)
 }
+
 // nopFetcher succeeds without cloning anything.
 type nopFetcher struct{}
 

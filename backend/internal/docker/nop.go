@@ -9,7 +9,7 @@ import "context"
 type NopBuilder struct{ Err error }
 
 func (n NopBuilder) Build(_ context.Context, _, _ string, _ LogSink) error { return n.Err }
-func (n NopBuilder) LoadIntoKind(_ context.Context, _ string) error         { return n.Err }
+func (n NopBuilder) LoadIntoKind(_ context.Context, _ string) error        { return n.Err }
 
 // NopFetcher is the matching SourceFetcher.
 type NopFetcher struct{ Err error }

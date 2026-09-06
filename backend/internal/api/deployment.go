@@ -21,10 +21,10 @@ import (
 // machine: trigger a new build, read a deployment's state, and stream
 // its build logs.
 type DeploymentHandler struct {
-	store    *storage.Queries
-	apps     *application.Service
-	orch     *deployment.Orchestrator
-	logger   *slog.Logger
+	store  *storage.Queries
+	apps   *application.Service
+	orch   *deployment.Orchestrator
+	logger *slog.Logger
 }
 
 // NewDeploymentHandler wires the dependencies. The handler does not
