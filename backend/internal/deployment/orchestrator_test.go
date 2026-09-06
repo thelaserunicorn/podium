@@ -41,7 +41,7 @@ func (f *fakeBuilder) Build(_ context.Context, dir, tag string, sink docker.LogS
 	return nil
 }
 
-func (f *fakeBuilder) LoadIntoKind(context.Context, string) error { return nil }
+func (f *fakeBuilder) LoadIntoKind(context.Context, string, string) error { return nil }
 
 // fakeFetcher implements docker.SourceFetcher.
 type fakeFetcher struct {
@@ -180,6 +180,11 @@ func TestClassifyReason(t *testing.T) {
 		{ErrDeployFailed, "deploy_failed"},
 		{fmt.Errorf("%w: bad", ErrDeployFailed), "deploy_failed"},
 		{ErrReadinessTimeout, "readiness_timeout"},
+		// Wrapped readiness timeout inside deploy-failed (the
+		// applier's currentReplicas error path) must surface as
+		// readiness_timeout, not deploy_failed. errors.Is walks
+		// the wrap chain and the check order is readiness first.
+		{fmt.Errorf("%w: %w", ErrDeployFailed, ErrReadinessTimeout), "readiness_timeout"},
 		{context.DeadlineExceeded, "build_timeout"},
 		{errors.New("something"), "something"},
 	}

@@ -3,6 +3,7 @@ package kubernetes
 import (
 	"context"
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -156,5 +157,68 @@ func TestNopApplier_ReturnsDeployFailed(t *testing.T) {
 	err := NopApplier{Err: errors.New("no kubeconfig")}.Apply(context.Background(), 1)
 	if !errors.Is(err, deployment.ErrDeployFailed) {
 		t.Errorf("err=%v, want errors.Is ErrDeployFailed", err)
+	}
+}
+
+// fakeImageLoader records the cluster name it was invoked with so
+// tests can assert Podium threads the kubeconfig-derived cluster name
+// into `kind load docker-image --name <cluster>`.
+type fakeImageLoader struct {
+	calls     []string
+	mu        sync.Mutex
+	returnErr error
+}
+
+func (f *fakeImageLoader) LoadIntoKind(_ context.Context, _, clusterName string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.calls = append(f.calls, clusterName)
+	return f.returnErr
+}
+
+func (f *fakeImageLoader) lastCluster() string {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	if len(f.calls) == 0 {
+		return ""
+	}
+	return f.calls[len(f.calls)-1]
+}
+
+// TestApplier_PassesClusterNameToLoader: the kind-load step must
+// receive the cluster name derived from kubeconfig so the image lands
+// in the right cluster when the host runs more than one. Without
+// this, `kind load` silently defaults to the alphabetically-first
+// cluster and the deployment's pods can't pull (ErrImagePull).
+func TestApplier_PassesClusterNameToLoader(t *testing.T) {
+	ctx := context.Background()
+	a, _, depID := newApplierFixture(t, 1)
+	a.Client.ClusterName = "podium"
+
+	loader := &fakeImageLoader{}
+	a.Loader = loader
+
+	// Drive ReadyReplicas up so the poll loop exits promptly.
+	cs := a.Client.CS.(*fake.Clientset)
+	cs.PrependReactor("get", "deployments", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		getAction, ok := action.(k8stesting.GetActionImpl)
+		if !ok {
+			return false, nil, nil
+		}
+		dep, err := cs.Tracker().Get(getAction.GetResource(), getAction.GetNamespace(), getAction.GetName())
+		if err != nil {
+			return false, nil, err
+		}
+		d := dep.(*appsv1.Deployment)
+		d.Status.ReadyReplicas = int32(*d.Spec.Replicas)
+		d.Status.Replicas = int32(*d.Spec.Replicas)
+		return true, d, nil
+	})
+
+	if err := a.Apply(ctx, depID); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if got := loader.lastCluster(); got != "podium" {
+		t.Errorf("LoadIntoKind called with clusterName=%q, want %q", got, "podium")
 	}
 }

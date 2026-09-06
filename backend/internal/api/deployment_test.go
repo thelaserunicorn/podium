@@ -44,7 +44,7 @@ func (s *slowBuilder) Build(ctx context.Context, _, _ string, sink docker.LogSin
 	s.mu.Unlock()
 	return nil
 }
-func (s *slowBuilder) LoadIntoKind(context.Context, string) error { return nil }
+func (s *slowBuilder) LoadIntoKind(context.Context, string, string) error { return nil }
 
 // instantBuilder returns success immediately.
 type instantBuilder struct{}
@@ -54,7 +54,7 @@ func (instantBuilder) Build(_ context.Context, _, _ string, sink docker.LogSink)
 	_ = sink.Append("Successfully built")
 	return nil
 }
-func (instantBuilder) LoadIntoKind(context.Context, string) error { return nil }
+func (instantBuilder) LoadIntoKind(context.Context, string, string) error { return nil }
 
 // errBuilder fails the build.
 type errBuilder struct{}
@@ -63,7 +63,7 @@ func (errBuilder) Build(_ context.Context, _, _ string, sink docker.LogSink) err
 	_ = sink.Append("Step 1/1 : FROM scratch")
 	return errors.New("boom")
 }
-func (errBuilder) LoadIntoKind(context.Context, string) error { return nil }
+func (errBuilder) LoadIntoKind(context.Context, string, string) error { return nil }
 
 // fixture wires up the mux + auth + a session cookie for alice. It
 // returns the mux, the storage queries, the cookie, alice's user id,

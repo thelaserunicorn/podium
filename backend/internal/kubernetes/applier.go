@@ -2,6 +2,7 @@ package kubernetes
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"time"
 
@@ -15,8 +16,12 @@ import (
 // kind cluster. Declared here (rather than reusing docker.Builder
 // directly) so the kubernetes package does not import the docker
 // package — the wiring in cmd/podium/main.go passes the builder.
+//
+// `clusterName` is the kind cluster to target; the applier passes
+// `a.Client.ClusterName` through. Empty string means "let kind pick"
+// (single-cluster setups).
 type ImageLoader interface {
-	LoadIntoKind(ctx context.Context, tag string) error
+	LoadIntoKind(ctx context.Context, tag, clusterName string) error
 }
 
 // Applier implements deployment.K8sApplier. It drives a single
@@ -101,7 +106,7 @@ func (a *Applier) Apply(ctx context.Context, deploymentID int64) error {
 		return fmt.Errorf("%w: %v", deployment.ErrDeployFailed, err)
 	}
 	if a.Loader != nil {
-		if err := a.Loader.LoadIntoKind(ctx, d.Image); err != nil {
+		if err := a.Loader.LoadIntoKind(ctx, d.Image, a.Client.ClusterName); err != nil {
 			return fmt.Errorf("%w: kind load: %v", deployment.ErrDeployFailed, err)
 		}
 	}
@@ -142,6 +147,15 @@ func (a *Applier) waitReady(origCtx context.Context, deploymentID int64, namespa
 	for {
 		cur, des, err := a.Client.CurrentReplicas(pollCtx, namespace, depName)
 		if err != nil {
+			// Distinguish a poll-deadline-expired read (which means
+			// "readyReplicas never reached desired" — the readiness
+			// poll timed out) from a transient k8s read failure (a
+			// genuine deploy failure). The pollCtx is the only one
+			// that fires context.DeadlineExceeded here because every
+			// other call site uses writeCtx / origCtx.
+			if errors.Is(err, context.DeadlineExceeded) {
+				return fmt.Errorf("%w: %v", deployment.ErrReadinessTimeout, err)
+			}
 			return fmt.Errorf("%w: %v", deployment.ErrDeployFailed, err)
 		}
 		if cur >= des {
