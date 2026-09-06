@@ -1,9 +1,8 @@
 package docker
 
 import (
-	"bytes"
 	"context"
-	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"os"
@@ -14,7 +13,6 @@ import (
 
 	"github.com/docker/docker/api/types/build"
 	dockerclient "github.com/docker/docker/client"
-	"github.com/docker/docker/pkg/stdcopy"
 )
 
 // fakeEngine is the smallest possible dockerclient.APIClient that
@@ -25,71 +23,34 @@ type fakeEngine struct {
 	buildReq build.ImageBuildOptions
 	tarBytes []byte
 
-	mu          sync.Mutex
-	stdoutBytes []byte // already-stdcopy-encoded
+	mu       sync.Mutex
+	bodyText string // raw response body text (newline-delimited JSON, no stdcopy)
 }
 
 func (f *fakeEngine) ImageBuild(_ context.Context, r io.Reader, opts build.ImageBuildOptions) (build.ImageBuildResponse, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.buildReq = opts
-	// Drain the tar body so we can assert on its length.
 	tarBytes, _ := io.ReadAll(r)
 	f.tarBytes = tarBytes
 	return build.ImageBuildResponse{
-		Body: io.NopCloser(bytes.NewReader(f.stdoutBytes)),
+		Body: io.NopCloser(strings.NewReader(f.bodyText)),
 	}, nil
 }
 
-// encodeStdcopy builds a docker Engine API-shaped response body
-// (stdcopy-framed stdout + stderr) from a list of (streamID, text)
-// pairs. The bytes returned are exactly what the daemon would emit
-// onto resp.Body — i.e., ready to be demuxed by stdcopy.StdCopy.
-func encodeStdcopy(t *testing.T, frames []struct {
-	stream byte
-	text   string
-},
-) []byte {
-	t.Helper()
-	buf := &bytes.Buffer{}
-	for _, f := range frames {
-		buf.Write(stdcopyFrame(f.stream, f.text))
-	}
-	// Validate wire format by round-tripping through stdcopy.
-	pr, pw := io.Pipe()
-	go func() {
-		_, _ = stdcopy.StdCopy(pw, pw, bytes.NewReader(buf.Bytes()))
-		_ = pw.Close()
-	}()
-	if _, err := io.ReadAll(pr); err != nil {
-		t.Fatalf("encodeStdcopy validation: %v", err)
-	}
-	// Return the framed bytes, not the demuxed text.
-	return buf.Bytes()
-}
+func TestClient_Build_StreamsNewlineDelimitedJSON(t *testing.T) {
+	// The Docker Engine /build endpoint returns newline-delimited
+	// JSON (one object per line), not stdcopy-framed. Both stream
+	// and errorDetail events live on the same body. Build passes
+	// the raw JSON through to the sink so the user can see the
+	// full daemon response in the build-log panel.
+	body := strings.Join([]string{
+		`{"stream":"Building image...\n"}`,
+		`{"stream":" ---\u003e abc123\n"}`,
+		"",
+	}, "\n")
 
-func stdcopyFrame(streamID byte, payload string) []byte {
-	size := uint32(len(payload))
-	header := make([]byte, 8)
-	header[0] = streamID
-	header[4] = byte(size >> 24)
-	header[5] = byte(size >> 16)
-	header[6] = byte(size >> 8)
-	header[7] = byte(size)
-	return append(header, []byte(payload)...)
-}
-
-func TestClient_Build_DemuxesStdoutAndStderr(t *testing.T) {
-	encoded := encodeStdcopy(t, []struct {
-		stream byte
-		text   string
-	}{
-		{1, "Building image...\n"},
-		{2, "npm WARN deprecated foo@1\n"},
-	})
-
-	engine := &fakeEngine{stdoutBytes: encoded}
-
+	engine := &fakeEngine{bodyText: body}
 	c, err := NewClient(engine, nil)
 	if err != nil {
 		t.Fatalf("NewClient: %v", err)
@@ -108,27 +69,22 @@ func TestClient_Build_DemuxesStdoutAndStderr(t *testing.T) {
 	if len(lines) != 2 {
 		t.Fatalf("expected 2 lines, got %d: %v", len(lines), lines)
 	}
-	// Goroutine scheduling means either stream can flush first.
 	have := map[string]bool{}
 	for _, l := range lines {
 		have[l] = true
 	}
-	if !have["Building image..."] {
-		t.Errorf("missing stdout line: %v", lines)
+	if !have[`{"stream":"Building image...\n"}`] {
+		t.Errorf("missing first line: %v", lines)
 	}
-	if !have["npm WARN deprecated foo@1"] {
-		t.Errorf("missing stderr line: %v", lines)
+	if !have[`{"stream":" ---\u003e abc123\n"}`] {
+		t.Errorf("missing second line: %v", lines)
 	}
 }
 
 func TestClient_Build_HandlesPartialFinalLine(t *testing.T) {
-	encoded := encodeStdcopy(t, []struct {
-		stream byte
-		text   string
-	}{
-		{1, "no newline at end"},
-	})
-	engine := &fakeEngine{stdoutBytes: encoded}
+	// The daemon may close the body without a trailing newline;
+	// Build should still flush the partial final line.
+	engine := &fakeEngine{bodyText: `{"stream":"no newline at end"}`}
 	c, err := NewClient(engine, nil)
 	if err != nil {
 		t.Fatal(err)
@@ -143,7 +99,7 @@ func TestClient_Build_HandlesPartialFinalLine(t *testing.T) {
 		t.Fatal(err)
 	}
 	lines := sink.Lines()
-	if len(lines) != 1 || lines[0] != "no newline at end" {
+	if len(lines) != 1 || lines[0] != `{"stream":"no newline at end"}` {
 		t.Errorf("got %v", lines)
 	}
 }
@@ -211,6 +167,43 @@ func TestClient_Build_PropagatesDaemonError(t *testing.T) {
 	}
 }
 
+// TestClient_Build_DetectsErrorDetailInBody: the Docker daemon
+// reports build failures (e.g. missing Dockerfile) by returning 200
+// OK with the errorDetail embedded in the response body. The moby
+// SDK does not surface this — engine.ImageBuild returns nil — so
+// Build() must scan the captured lines for the marker. Without
+// this check the orchestrator would proceed to the k8s apply step
+// with no image to load.
+func TestClient_Build_DetectsErrorDetailInBody(t *testing.T) {
+	body := strings.Join([]string{
+		`{"stream":"Sending build context to Docker daemon\n"}`,
+		`{"errorDetail":{"code":1,"message":"Cannot locate specified Dockerfile: Dockerfile"},"error":"Cannot locate specified Dockerfile: Dockerfile"}`,
+		"",
+	}, "\n")
+	engine := &fakeEngine{bodyText: body}
+	c, err := NewClient(engine, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dir := t.TempDir()
+	sink := &recordingSink{}
+	err = c.Build(context.Background(), dir, "x:v1", sink)
+	if err == nil {
+		t.Fatal("Build should fail when daemon reports errorDetail in body")
+	}
+	if !errors.Is(err, ErrBuildFailed) {
+		t.Errorf("expected ErrBuildFailed, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "Cannot locate specified Dockerfile") {
+		t.Errorf("error should carry the daemon message, got %v", err)
+	}
+	// Both lines should still be visible in the log stream so the
+	// user sees the full build context in the build-log panel.
+	if len(sink.Lines()) < 2 {
+		t.Errorf("expected at least 2 captured lines, got %d: %v", len(sink.Lines()), sink.Lines())
+	}
+}
+
 func TestClient_LoadIntoKind_UsesRunner(t *testing.T) {
 	engine := &fakeEngine{}
 	r := &fakeRunner{response: "loaded\n"}
@@ -239,26 +232,3 @@ func (e *errorEngine) ImageBuild(_ context.Context, _ io.Reader, _ build.ImageBu
 
 // Compile-time assertion: errorEngine also satisfies dockerclient.APIClient.
 var _ dockerclient.APIClient = (*errorEngine)(nil)
-
-// Sanity check that stdcopyFrame emits parseable JSON events too.
-func TestStdcopyFrame_RoundTrip(t *testing.T) {
-	payload := `{"stream":"Step 1/2 : FROM scratch"}`
-	frame := stdcopyFrame(1, payload)
-	// Length sanity: header (8) + payload.
-	if len(frame) != 8+len(payload) {
-		t.Errorf("frame length=%d want=%d", len(frame), 8+len(payload))
-	}
-	// Verify the encoded size matches.
-	size := uint32(frame[4])<<24 | uint32(frame[5])<<16 | uint32(frame[6])<<8 | uint32(frame[7])
-	if size != uint32(len(payload)) {
-		t.Errorf("encoded size=%d want=%d", size, len(payload))
-	}
-	// Confirm we can decode the embedded JSON.
-	var probe map[string]any
-	if err := json.Unmarshal([]byte(payload), &probe); err != nil {
-		t.Fatal(err)
-	}
-	if probe["stream"] != "Step 1/2 : FROM scratch" {
-		t.Errorf("decoded stream=%v", probe["stream"])
-	}
-}

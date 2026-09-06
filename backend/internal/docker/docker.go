@@ -10,6 +10,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os"
 	"os/exec"
 	"strings"
 )
@@ -101,11 +102,21 @@ func (osRunner) Run(ctx context.Context, name string, args ...string) (string, e
 // loadIntoKind is the shared implementation behind the real Client
 // and the test fake. The runner does the actual subprocess work; this
 // just formats the command and classifies the error.
+//
+// If KIND_CLUSTER_NAME is set in the environment, the command
+// includes `--name <cluster>` so the image lands in the right
+// cluster (relevant when the host has more than one kind cluster).
+// `kind load` defaults to the only/first cluster when the flag is
+// absent, which is fine for the common single-cluster setup.
 func loadIntoKind(ctx context.Context, runner cmdRunner, tag string) error {
 	if err := ValidateTag(tag); err != nil {
 		return err
 	}
-	out, err := runner.Run(ctx, "kind", "load", "docker-image", tag)
+	args := []string{"load", "docker-image", tag}
+	if name := os.Getenv("KIND_CLUSTER_NAME"); name != "" {
+		args = append(args, "--name", name)
+	}
+	out, err := runner.Run(ctx, "kind", args...)
 	if err != nil {
 		return fmt.Errorf("%w: %s", ErrKindLoadFailed, strings.TrimSpace(out))
 	}

@@ -10,7 +10,6 @@ import (
 
 	"github.com/docker/docker/api/types/build"
 	dockerclient "github.com/docker/docker/client"
-	"github.com/docker/docker/pkg/stdcopy"
 )
 
 // Client is the real docker.Builder implementation. It talks to the
@@ -77,52 +76,74 @@ func (c *Client) Build(ctx context.Context, dir, tag string, sink LogSink) error
 	}
 	defer resp.Body.Close()
 
-	// stdcopy expects one Reader for stdout and one for stderr; both
-	// come multiplexed in resp.Body. We split them into separate
-	// in-memory pipes, then line-buffer each into the same sink.
-	stdoutR, stdoutW := io.Pipe()
-	stderrR, stderrW := io.Pipe()
+	// The Docker Engine /build endpoint returns the build progress as
+	// newline-delimited JSON (one JSON object per line: stream /
+	// status / errorDetail / aux). It is NOT a stdcopy-multiplexed
+	// stream — that framing is reserved for attach/exec. Read the
+	// body directly and line-split into the sink.
+	var capture linesBuffer
+	var buf string
+	errCh := drainLines(resp.Body, &buf, &teeSink{sink: sink, capture: &capture})
 
-	go func() {
-		_, copyErr := stdcopy.StdCopy(stdoutW, stderrW, resp.Body)
-		_ = stdoutW.CloseWithError(copyErr)
-		_ = stderrW.CloseWithError(copyErr)
-	}()
-
-	var stdoutBuf, stderrBuf string
-	stdoutErrCh := drainLines(stdoutR, &stdoutBuf, sink)
-	stderrErrCh := drainLines(stderrR, &stderrBuf, sink)
-
-	stdoutErr := <-stdoutErrCh
-	stderrErr := <-stderrErrCh
-	// Flush any trailing partial lines from each stream's buffer.
-	// Only append when non-empty — drainLines only writes complete
-	// lines, so an empty buffer means the stream ended exactly on a
-	// newline (or had no output at all).
-	if stdoutBuf != "" {
-		if err := sink.Append(stdoutBuf); err != nil {
+	if err := <-errCh; err != nil && !isBenignClose(err) {
+		return fmt.Errorf("read build stream: %w", err)
+	}
+	if buf != "" {
+		if err := sink.Append(buf); err != nil {
 			return err
 		}
-		stdoutBuf = ""
-	}
-	if stderrBuf != "" {
-		if err := sink.Append(stderrBuf); err != nil {
-			return err
-		}
-		stderrBuf = ""
 	}
 
-	if stdoutErr != nil && !isBenignClose(stdoutErr) {
-		return fmt.Errorf("read build stdout: %w", stdoutErr)
+	// ImageBuild returns 200 even when the build itself fails — the
+	// errorDetail is embedded in the response body. Scan the captured
+	// lines for it and return ErrBuildFailed if found.
+	if msg := findBuildError(capture.Lines()); msg != "" {
+		return fmt.Errorf("%w: %s", ErrBuildFailed, msg)
 	}
-	if stderrErr != nil && !isBenignClose(stderrErr) {
-		return fmt.Errorf("read build stderr: %w", stderrErr)
-	}
-
-	// ImageBuild returns a non-zero Body when the build itself fails.
-	// We surface any captured error line from the stream as the
-	// wrapping message.
 	return nil
+}
+
+// teeSink forwards each line to both the user-facing sink (so the
+// build-log viewer sees it) and an in-memory capture (so Build can
+// inspect the stream after it drains).
+type teeSink struct {
+	sink    LogSink
+	capture *linesBuffer
+}
+
+func (t *teeSink) Append(line string) error {
+	t.capture.append(line)
+	return t.sink.Append(line)
+}
+
+// linesBuffer is a tiny mutex-free append-only buffer (Build is
+// single-goroutine wrt the capture; drainLines writes from one
+// goroutine, Build reads after the drain channel closes).
+type linesBuffer struct {
+	buf []string
+}
+
+func (l *linesBuffer) append(line string) {
+	l.buf = append(l.buf, line)
+}
+
+func (l *linesBuffer) Lines() []string {
+	return l.buf
+}
+
+// findBuildError scans the captured stderr lines for the daemon's
+// build-failure marker. The Docker daemon emits one JSON object per
+// line in the response body; build errors carry an `errorDetail` key.
+// The marker appears verbatim in the stderr stream after stdcopy
+// demux. We look for the literal `errorDetail` substring in any line;
+// if found we return the line (trimmed) as the failure message.
+func findBuildError(lines []string) string {
+	for _, ln := range lines {
+		if strings.Contains(ln, "errorDetail") {
+			return strings.TrimSpace(ln)
+		}
+	}
+	return ""
 }
 
 // LoadIntoKind delegates to the shared loadIntoKind with the client's

@@ -26,7 +26,11 @@ func NewGitSourceFetcher() *GitSourceFetcher {
 }
 
 // Fetch clones repoURL into destDir as a shallow clone. If destDir
-// already exists and is a valid git repo, Fetch does nothing (idempotent).
+// already exists and contains a .git directory, Fetch does nothing
+// (idempotent — repeated deploys reuse the prior clone). Otherwise
+// the directory is removed and `git clone --depth=1` runs fresh, so a
+// stale partial clone from a prior failed run doesn't trip the "not
+// an empty directory" check that `git clone` enforces.
 func (g *GitSourceFetcher) Fetch(ctx context.Context, repoURL, destDir string) error {
 	if repoURL == "" {
 		return fmt.Errorf("repository URL is empty")
@@ -36,6 +40,15 @@ func (g *GitSourceFetcher) Fetch(ctx context.Context, repoURL, destDir string) e
 	}
 	if err := os.MkdirAll(filepath.Dir(destDir), 0o755); err != nil {
 		return fmt.Errorf("mkdir parent: %w", err)
+	}
+	if _, err := os.Stat(filepath.Join(destDir, ".git")); err == nil {
+		// Existing valid clone — reuse it.
+		return nil
+	}
+	// Either the dir doesn't exist or it's a stale partial clone
+	// from a prior failure; wipe it so `git clone` can create fresh.
+	if err := os.RemoveAll(destDir); err != nil {
+		return fmt.Errorf("clear stale source dir: %w", err)
 	}
 	out, err := g.Runner.Run(ctx, "git", "clone", "--depth=1", repoURL, destDir)
 	if err != nil {

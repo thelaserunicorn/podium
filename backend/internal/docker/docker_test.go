@@ -141,6 +141,7 @@ func (f *fakeRunner) LastCall() (string, []string) {
 }
 
 func TestLoadIntoKind_Success(t *testing.T) {
+	t.Setenv("KIND_CLUSTER_NAME", "")
 	r := &fakeRunner{response: "Image: \"my-api:v1\" kind cluster node(s) loaded image to nodes.\n"}
 	if err := loadIntoKind(context.Background(), r, "my-api:v1"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
@@ -150,6 +151,26 @@ func TestLoadIntoKind_Success(t *testing.T) {
 		t.Errorf("executable=%q want kind", name)
 	}
 	wantArgs := []string{"load", "docker-image", "my-api:v1"}
+	if !equal(args, wantArgs) {
+		t.Errorf("args=%v want %v", args, wantArgs)
+	}
+}
+
+// TestLoadIntoKind_UsesClusterNameFromEnv verifies that when
+// KIND_CLUSTER_NAME is set, the kind invocation includes
+// `--name <cluster>` so the image lands in the right cluster when
+// the host runs more than one.
+func TestLoadIntoKind_UsesClusterNameFromEnv(t *testing.T) {
+	t.Setenv("KIND_CLUSTER_NAME", "podium")
+	r := &fakeRunner{response: "loaded\n"}
+	if err := loadIntoKind(context.Background(), r, "my-api:v1"); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	name, args := r.LastCall()
+	if name != "kind" {
+		t.Errorf("executable=%q want kind", name)
+	}
+	wantArgs := []string{"load", "docker-image", "my-api:v1", "--name", "podium"}
 	if !equal(args, wantArgs) {
 		t.Errorf("args=%v want %v", args, wantArgs)
 	}
