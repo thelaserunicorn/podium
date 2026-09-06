@@ -29,6 +29,7 @@ frontend/.vite/
 frontend/.next/
 frontend/build/
 frontend/*.local
+frontend/tsconfig.tsbuildinfo
 
 # puku CLI artifacts
 .puku/puku-embeddings.db

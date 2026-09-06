@@ -1,0 +1,304 @@
+package api
+
+import (
+	"context"
+	"database/sql"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"log/slog"
+	"net/http"
+	"strconv"
+	"time"
+
+	"github.com/podium/podium/internal/application"
+	"github.com/podium/podium/internal/auth"
+	"github.com/podium/podium/internal/deployment"
+	"github.com/podium/podium/internal/storage"
+)
+
+// DeploymentHandler exposes the HTTP surface for the deployment state
+// machine: trigger a new build, read a deployment's state, and stream
+// its build logs.
+type DeploymentHandler struct {
+	store  *storage.Queries
+	apps   *application.Service
+	orch   *deployment.Orchestrator
+	logger *slog.Logger
+}
+
+// NewDeploymentHandler wires the dependencies. The handler does not
+// start any goroutines itself — the orchestrator manages lifecycle.
+func NewDeploymentHandler(store *storage.Queries, apps *application.Service, orch *deployment.Orchestrator, logger *slog.Logger) *DeploymentHandler {
+	if logger == nil {
+		logger = slog.Default()
+	}
+	return &DeploymentHandler{store: store, apps: apps, orch: orch, logger: logger}
+}
+
+// Mount registers the routes under the given mux. Every route is
+// wrapped in RequireAuth.
+func (h *DeploymentHandler) Mount(mux *http.ServeMux) {
+	wrapped := func(handler http.HandlerFunc) http.Handler {
+		return RequireAuth(http.HandlerFunc(handler))
+	}
+	mux.Handle("POST /api/applications/{id}/deploy", wrapped(h.Deploy))
+	mux.Handle("GET /api/deployments/{id}", wrapped(h.GetDeployment))
+	mux.Handle("GET /api/applications/{id}/deployments", wrapped(h.ListDeployments))
+	mux.Handle("GET /api/deployments/{id}/logs", wrapped(h.GetLogs))
+}
+
+// deployRequest is the JSON body for POST /api/applications/{id}/deploy.
+type deployRequest struct {
+	Namespace string `json:"namespace"`
+	Replicas  *int   `json:"replicas,omitempty"`
+}
+
+// deployResponse is the JSON body returned by POST /api/applications/{id}/deploy.
+type deployResponse struct {
+	Deployment *storage.Deployment `json:"deployment"`
+}
+
+// Deploy handles POST /api/applications/{id}/deploy. It validates
+// ownership, allocates the next version, creates a QUEUED deployment
+// row, and kicks off the orchestrator goroutine.
+//
+// Returns:
+//   - 201 Created with { deployment } on success.
+//   - 400 if the namespace is invalid.
+//   - 404 if the app does not exist or is not owned by the caller.
+//   - 409 if another deployment for this app+namespace is already in flight.
+func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+
+	appID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid application id")
+		return
+	}
+
+	app, err := h.apps.Get(r.Context(), appID, user.ID)
+	if err != nil {
+		if errors.Is(err, application.ErrNotFound) {
+			writeJSONError(w, http.StatusNotFound, "application not found")
+			return
+		}
+		h.logger.Error("get application", "err", err)
+		writeJSONError(w, http.StatusInternalServerError, "internal_error")
+		return
+	}
+
+	var req deployRequest
+	if r.ContentLength > 0 {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid json")
+			return
+		}
+	}
+	namespace := req.Namespace
+	if namespace == "" {
+		namespace = "podium-dev" // MVP default; switcher lands in M6
+	}
+	if err := application.ValidateNamespaceName(namespace); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid namespace: "+err.Error())
+		return
+	}
+
+	replicas := 3
+	if req.Replicas != nil {
+		replicas = *req.Replicas
+	}
+	if replicas < 1 || replicas > 5 {
+		writeJSONError(w, http.StatusBadRequest, "replicas must be 1..5")
+		return
+	}
+
+	envID, err := h.store.EnvironmentIDByNamespace(r.Context(), namespace)
+	if err != nil {
+		// Namespace doesn't exist yet. For M2 we only support the
+		// three defaults; the frontend should never send anything
+		// else. Custom namespaces land in M3.
+		writeJSONError(w, http.StatusBadRequest, "unknown namespace "+namespace)
+		return
+	}
+
+	active, err := h.store.HasActiveDeployment(r.Context(), appID, envID)
+	if err != nil {
+		h.logger.Error("check active deployment", "err", err)
+		writeJSONError(w, http.StatusInternalServerError, "internal_error")
+		return
+	}
+	if active {
+		writeJSONError(w, http.StatusConflict, "deployment_already_in_progress")
+		return
+	}
+
+	// Bump the version counter first so the deployment row carries
+	// the right tag. SQLite serialises the UPDATE.
+	version, err := h.store.ApplicationNextVersion(r.Context(), appID)
+	if err != nil {
+		h.logger.Error("bump version", "err", err)
+		writeJSONError(w, http.StatusInternalServerError, "internal_error")
+		return
+	}
+	image := fmt.Sprintf("%s:v%d", app.Name, version)
+
+	deploymentID, err := h.store.CreateDeployment(r.Context(), appID, envID, version, replicas, image)
+	if err != nil {
+		h.logger.Error("create deployment", "err", err)
+		writeJSONError(w, http.StatusInternalServerError, "internal_error")
+		return
+	}
+
+	// Kick off the orchestrator. We don't wait for the build — the
+	// client polls /api/deployments/{id} and /api/deployments/{id}/logs.
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		defer cancel()
+		if err := h.orch.Run(ctx, deploymentID, appID, app.Name, app.RepositoryURL, envID, replicas); err != nil {
+			h.logger.Info("deployment finished with error",
+				"deployment_id", deploymentID,
+				"err", err)
+		}
+	}()
+
+	d, err := h.store.GetDeployment(context.Background(), deploymentID)
+	if err != nil {
+		h.logger.Error("read back deployment", "err", err)
+		writeJSONError(w, http.StatusInternalServerError, "internal_error")
+		return
+	}
+	writeJSON(w, http.StatusCreated, deployResponse{Deployment: d})
+}
+
+// GetDeployment returns the current state of a single deployment.
+// Returns 404 if the deployment doesn't exist or belongs to another
+// user (we never leak existence, AGENTS.md §19).
+func (h *DeploymentHandler) GetDeployment(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+	d, err := h.store.GetDeployment(r.Context(), id)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeJSONError(w, http.StatusNotFound, "deployment not found")
+			return
+		}
+		h.logger.Error("get deployment", "err", err)
+		writeJSONError(w, http.StatusInternalServerError, "internal_error")
+		return
+	}
+	// Authorize: deployment belongs to one of the caller's apps.
+	app, err := h.apps.Get(r.Context(), d.ApplicationID, user.ID)
+	if err != nil {
+		writeJSONError(w, http.StatusNotFound, "deployment not found")
+		return
+	}
+	_ = app
+	writeJSON(w, http.StatusOK, map[string]any{"deployment": d})
+}
+
+// ListDeployments returns the deployment history for an app in a
+// namespace (defaults to podium-dev).
+func (h *DeploymentHandler) ListDeployments(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	appID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid application id")
+		return
+	}
+	if _, err := h.apps.Get(r.Context(), appID, user.ID); err != nil {
+		if errors.Is(err, application.ErrNotFound) {
+			writeJSONError(w, http.StatusNotFound, "application not found")
+			return
+		}
+		writeJSONError(w, http.StatusInternalServerError, "internal_error")
+		return
+	}
+	namespace := r.URL.Query().Get("namespace")
+	if namespace == "" {
+		namespace = "podium-dev"
+	}
+	envID, err := h.store.EnvironmentIDByNamespace(r.Context(), namespace)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "unknown namespace")
+		return
+	}
+	out, err := h.store.ListDeployments(r.Context(), appID, envID)
+	if err != nil {
+		writeJSONError(w, http.StatusInternalServerError, "internal_error")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"deployments": out})
+}
+
+// logLineJSON is the wire shape of a single log line in the response.
+type logLineJSON struct {
+	TS   string `json:"ts"`
+	Line string `json:"line"`
+}
+
+// GetLogs returns build log lines for a deployment, optionally
+// filtered to lines with ts > since (RFC3339).
+func (h *DeploymentHandler) GetLogs(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+	d, err := h.store.GetDeployment(r.Context(), id)
+	if err != nil {
+		writeJSONError(w, http.StatusNotFound, "deployment not found")
+		return
+	}
+	if _, err := h.apps.Get(r.Context(), d.ApplicationID, user.ID); err != nil {
+		writeJSONError(w, http.StatusNotFound, "deployment not found")
+		return
+	}
+
+	var since time.Time
+	if sinceStr := r.URL.Query().Get("since"); sinceStr != "" {
+		t, err := time.Parse(time.RFC3339Nano, sinceStr)
+		if err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid since")
+			return
+		}
+		since = t
+	}
+
+	lines, err := h.store.LogLinesSince(r.Context(), id, since)
+	if err != nil {
+		h.logger.Error("read log lines", "err", err)
+		writeJSONError(w, http.StatusInternalServerError, "internal_error")
+		return
+	}
+	out := make([]logLineJSON, 0, len(lines))
+	for _, l := range lines {
+		out = append(out, logLineJSON{TS: storage.FormatPodTS(l.TS), Line: l.Line})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{"lines": out})
+}
+
+func writeJSONError(w http.ResponseWriter, status int, code string) {
+	writeError(w, status, code, "")
+}
