@@ -211,17 +211,24 @@ func (o *Orchestrator) fail(ctx context.Context, deploymentID int64, cause error
 
 // classifyReason maps an underlying error into the short reason
 // strings documented in DECISIONS.md B.
+//
+// Order matters: ErrReadinessTimeout is checked before ErrDeployFailed
+// because the applier may wrap a readiness-timeout as ErrDeployFailed
+// (e.g. when currentReplicas fails on the poll deadline). errors.Is
+// walks the wrap chain, so checking ErrReadinessTimeout first means
+// the more specific reason wins regardless of how the caller wrapped
+// the error.
 func classifyReason(err error) string {
 	if err == nil {
 		return ""
 	}
 	switch {
+	case errors.Is(err, ErrReadinessTimeout):
+		return "readiness_timeout"
 	case errors.Is(err, ErrBuildFailed), errors.Is(err, docker.ErrBuildFailed):
 		return "build_failed"
 	case errors.Is(err, ErrDeployFailed):
 		return "deploy_failed"
-	case errors.Is(err, ErrReadinessTimeout):
-		return "readiness_timeout"
 	case errors.Is(err, context.DeadlineExceeded):
 		return "build_timeout"
 	default:
