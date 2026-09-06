@@ -1,0 +1,38 @@
+# Podium control-plane data (SQLite lives here in dockerized run)
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
+# Local environment / secrets
+.env
+.env.local
+*.local
+
+# Editor / OS
+.DS_Store
+.vscode/
+.idea/
+*.swp
+*~
+
+# Build artifacts
+backend/bin/
+backend/dist/
+backend/podium
+backend/podium-*
+frontend/dist/
+frontend/dist-ssr/
+frontend/node_modules/
+frontend/.vite/
+frontend/.next/
+frontend/build/
+frontend/*.local
+
+# puku CLI artifacts
+.puku/puku-embeddings.db
+.puku/cache/
+
+# puku-cli per-user file (never commit personal prefs)
+PUKU.local.md
