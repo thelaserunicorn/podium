@@ -68,6 +68,12 @@ func (a *Applier) defaults() {
 }
 
 // Apply is the deployment.K8sApplier entry point.
+//
+// The supplied `ctx` is used for the apply steps (EnsureNamespace,
+// ApplyDeployment, ApplyService, LoadIntoKind). The readiness poll
+// uses a fresh `context.Background()` derived timeout so the orchestrator's
+// Deploy-timeout cap does not bleed into the wait phase — those are
+// independently tunable (Timeouts.Readiness).
 func (a *Applier) Apply(ctx context.Context, deploymentID int64) error {
 	a.defaults()
 	d, err := a.Store.GetDeployment(ctx, deploymentID)
@@ -104,19 +110,33 @@ func (a *Applier) Apply(ctx context.Context, deploymentID int64) error {
 		return fmt.Errorf("kubernetes: set STARTING: %w", err)
 	}
 
+	// Readiness wait uses a fresh poll context — see the doc above.
+	// We pass the original ctx so writeCtx can inherit its deadline
+	// for the SQLite status flips.
 	return a.waitReady(ctx, deploymentID, env.Namespace, depName, d.Replicas)
 }
 
-func (a *Applier) waitReady(ctx context.Context, deploymentID int64, namespace, depName string, replicas int) error {
-	pollCtx, cancel := context.WithTimeout(ctx, a.ReadyTimeout)
+func (a *Applier) waitReady(origCtx context.Context, deploymentID int64, namespace, depName string, replicas int) error {
+	pollCtx, cancel := context.WithTimeout(context.Background(), a.ReadyTimeout)
 	defer cancel()
+	// writeCtx is the context used for the SQLite status writes; it
+	// must not be cancelled when pollCtx fires. We derive from
+	// context.Background so the status flip survives a readiness
+	// timeout.
+	writeCtx := context.Background()
+	if deadline, ok := origCtx.Deadline(); ok {
+		var writeCancel context.CancelFunc
+		writeCtx, writeCancel = context.WithDeadline(context.Background(), deadline)
+		defer writeCancel()
+	}
+
 	ticker := time.NewTicker(a.PollEvery)
 	defer ticker.Stop()
 
 	// Scale-to-zero flips to RUNNING as soon as the Deployment object
 	// exists (DECISIONS.md B). Anything else polls.
 	if replicas == 0 {
-		return a.Store.SetDeploymentStatus(ctx, deploymentID, storage.StatusRunning, "")
+		return a.Store.SetDeploymentStatus(writeCtx, deploymentID, storage.StatusRunning, "")
 	}
 
 	for {
@@ -125,11 +145,11 @@ func (a *Applier) waitReady(ctx context.Context, deploymentID int64, namespace, 
 			return fmt.Errorf("%w: %v", deployment.ErrDeployFailed, err)
 		}
 		if cur >= des {
-			return a.Store.SetDeploymentStatus(ctx, deploymentID, storage.StatusRunning, "")
+			return a.Store.SetDeploymentStatus(writeCtx, deploymentID, storage.StatusRunning, "")
 		}
 		select {
 		case <-pollCtx.Done():
-			_ = a.Store.SetDeploymentStatus(ctx, deploymentID, storage.StatusFailed, "readiness_timeout")
+			_ = a.Store.SetDeploymentStatus(writeCtx, deploymentID, storage.StatusFailed, "readiness_timeout")
 			return fmt.Errorf("%w: %v", deployment.ErrReadinessTimeout, pollCtx.Err())
 		case <-ticker.C:
 		}
