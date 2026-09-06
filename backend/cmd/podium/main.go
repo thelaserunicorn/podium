@@ -19,6 +19,8 @@ import (
 	"github.com/podium/podium/internal/api"
 	"github.com/podium/podium/internal/application"
 	"github.com/podium/podium/internal/auth"
+	"github.com/podium/podium/internal/deployment"
+	"github.com/podium/podium/internal/docker"
 	"github.com/podium/podium/internal/storage"
 )
 
@@ -38,6 +40,7 @@ func run() error {
 	dbPath := getenv("PODIUM_DB_PATH", filepath.Join("data", "podium.db"))
 	adminUser := getenv("PODIUM_ADMIN_USERNAME", "admin")
 	adminPass := os.Getenv("PODIUM_ADMIN_PASSWORD")
+	sourceRoot := getenv("PODIUM_SOURCE_ROOT", filepath.Join(filepath.Dir(dbPath), "sources"))
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
@@ -56,10 +59,32 @@ func run() error {
 	authSvc := auth.NewService(db)
 	appSvc := application.NewService(db)
 
+	// Deployment pipeline: docker client (real) + orchestrator. The
+	// real K8sApplier lands in M3; in M2 the orchestrator stops at
+	// BUILT. Failures here are non-fatal so the dashboard still
+	// serves even without a kind cluster.
+	builder, builderErr := docker.NewClient(nil, nil)
+	if builderErr != nil {
+		logger.Warn("docker client unavailable; deploy endpoints will surface build errors", "err", builderErr)
+	}
+	var deployBuilder docker.Builder = docker.NopBuilder{Err: builderErr}
+	var fetcher docker.SourceFetcher = docker.NopFetcher{Err: builderErr}
+	if builderErr == nil {
+		deployBuilder = builder
+		fetcher = docker.NewGitSourceFetcher()
+	}
+	queries := storage.NewQueries(db)
+	orch := deployment.NewOrchestrator(
+		queries, deployBuilder, fetcher, sourceRoot,
+		deployment.Timeouts{Build: 15 * time.Minute},
+		nil, // k8s applier — wired in M3
+	)
+
 	// HTTP wiring.
 	mux := http.NewServeMux()
 	api.MountAuth(mux, auth.NewHandler(authSvc))
 	api.MountApplications(mux, application.NewHandler(appSvc))
+	api.NewDeploymentHandler(queries, appSvc, orch, logger).Mount(mux)
 	api.NewAdminHandler(authSvc).Mount(mux)
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
