@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
-# M1 smoke test — exercises the §48 acceptance walkthrough up through
-# "create application" (Docker/K8s parts land in M2/M3).
+# Podium smoke test — exercises the §48 acceptance walkthrough.
+# M1: auth + application CRUD. M2: deploy + build log streaming.
+# M3+ (k8s apply, scale, restart, rollback, etc.) will append below.
 set -euo pipefail
 
 BASE=${BASE:-http://localhost:18080}
@@ -117,3 +118,111 @@ split_code "$(req POST /api/applications '{"name":"after-logout","repository_url
 
 echo
 echo "All M1 smoke checks passed."
+
+# -------------------------------------------------------------------------
+# M2 — Deploy + build log streaming
+# -------------------------------------------------------------------------
+# Prereqs for M2 checks: alice is still logged in at the top of this jar,
+# and "my-api" exists from step 11. The smoke env may or may not have a
+# Docker daemon; we don't care — the orchestrator drives the state machine
+# to BUILT (or FAILED) and the API surface we exercise is daemon-agnostic.
+
+# M2.1 alice (re-)logs in (cookie jar was wiped for cross-user checks)
+rm -f "$JAR"
+split_code "$(req POST /api/auth/login '{"username":"alice","password":"alice-secret"}')"
+[[ $CODE == 200 ]] && pass "alice re-login -> 200" || fail "alice re-login $CODE: $BODY"
+
+# M2.1b ensure the app exists (M1 section only creates it on a clean DB)
+split_code "$(req POST /api/applications '{"name":"my-api","repository_url":"https://github.com/alice/my-api","container_port":8080}')"
+case $CODE in
+  201)
+    NEW_ID=$(echo "$BODY" | python3 -c 'import sys,json; print(json.load(sys.stdin)["application"]["id"])')
+    APP_ID=$NEW_ID
+    pass "M2 app created (id=$APP_ID)"
+    ;;
+  409)
+    pass "M2 app already exists (keeping id=$APP_ID)"
+    ;;
+  *)   fail "M2 create app returned $CODE: $BODY" ;;
+esac
+echo "  using app id = $APP_ID"
+
+# M2.2 alice deploys my-api. Without docker, the orchestrator fails fast
+# and surfaces FAILED + reason; with docker it walks through BUILDING→BUILT.
+# Both are valid outcomes — we just check the deployment row was created.
+split_code "$(req POST /api/applications/$APP_ID/deploy '{"namespace":"podium-dev","replicas":3}')"
+if [[ $CODE == 201 ]]; then
+  pass "deploy -> 201 (orchestrator accepted)"
+elif [[ $CODE == 409 ]]; then
+  pass "deploy -> 409 (already in progress from a prior run)"
+else
+  fail "deploy returned $CODE: $BODY"
+fi
+DEP_ID=$(echo "$BODY" | python3 -c 'import sys,json; print(json.load(sys.stdin)["deployment"]["id"])')
+echo "  deployment id = $DEP_ID"
+
+# M2.3 read it back
+split_code "$(req GET /api/deployments/$DEP_ID)"
+[[ $CODE == 200 ]] && pass "get deployment -> 200" || fail "get deployment $CODE: $BODY"
+STATUS=$(echo "$BODY" | python3 -c 'import sys,json; print(json.load(sys.stdin)["deployment"]["status"])')
+echo "  initial status = $STATUS"
+
+# M2.4 wait for terminal state. With docker, ~5-30s; without docker, ~1s.
+WAITED=0
+TERMINAL=""
+while [[ $WAITED -lt 60 ]]; do
+  split_code "$(req GET /api/deployments/$DEP_ID)"
+  STATUS=$(echo "$BODY" | python3 -c 'import sys,json; print(json.load(sys.stdin)["deployment"]["status"])')
+  case $STATUS in
+    BUILT|RUNNING|FAILED) TERMINAL=$STATUS; break ;;
+  esac
+  sleep 1
+  WAITED=$((WAITED+1))
+done
+if [[ -z $TERMINAL ]]; then
+  fail "deployment $DEP_ID never reached terminal state after ${WAITED}s (last=$STATUS)"
+fi
+pass "deployment reached $TERMINAL in ${WAITED}s"
+
+# M2.5 fetch build logs — must return at least one log line.
+split_code "$(req GET /api/deployments/$DEP_ID/logs)"
+[[ $CODE == 200 ]] && pass "logs -> 200" || fail "logs $CODE: $BODY"
+LINE_COUNT=$(echo "$BODY" | python3 -c 'import sys,json; print(len(json.load(sys.stdin)["lines"]))')
+if [[ $LINE_COUNT -lt 1 ]]; then
+  fail "expected at least 1 log line, got $LINE_COUNT: $BODY"
+fi
+pass "logs returned $LINE_COUNT line(s)"
+
+# M2.6 list deployments for the app, scoped to the namespace.
+split_code "$(req GET /api/applications/$APP_ID/deployments?namespace=podium-dev)"
+[[ $CODE == 200 ]] && pass "list deployments -> 200" || fail "list $CODE: $BODY"
+LIST_COUNT=$(echo "$BODY" | python3 -c 'import sys,json; print(len(json.load(sys.stdin)["deployments"]))')
+[[ $LIST_COUNT -ge 1 ]] && pass "list has $LIST_COUNT deployment(s)" || fail "list empty"
+
+# M2.7 a second concurrent deploy while one is in flight should 409
+# (only meaningful for docker builds, but the check is safe either way —
+# without docker the first one is already FAILED, so a second goes through).
+if [[ $TERMINAL != "FAILED" ]]; then
+  split_code "$(req POST /api/applications/$APP_ID/deploy '{"namespace":"podium-dev"}')"
+  if [[ $CODE == 409 ]]; then
+    pass "concurrent deploy -> 409 (conflict as expected)"
+  elif [[ $CODE == 201 ]]; then
+    # Race lost — first build finished before our second hit. Tolerated.
+    pass "concurrent deploy -> 201 (first build raced to completion)"
+    DEP_ID=$(echo "$BODY" | python3 -c 'import sys,json; print(json.load(sys.stdin)["deployment"]["id"])')
+  else
+    fail "concurrent deploy returned $CODE: $BODY"
+  fi
+fi
+
+# M2.8 invalid namespace rejected at the API boundary
+split_code "$(req POST /api/applications/$APP_ID/deploy '{"namespace":"Bad Name"}')"
+[[ $CODE == 400 ]] && pass "invalid namespace -> 400" || fail "bad namespace got $CODE: $BODY"
+
+# M2.9 unauthenticated deploy blocked
+rm -f "$JAR"
+split_code "$(req POST /api/applications/$APP_ID/deploy '{}')"
+[[ $CODE == 401 ]] && pass "unauth deploy -> 401" || fail "unauth got $CODE: $BODY"
+
+echo
+echo "All M1 + M2 smoke checks passed."
