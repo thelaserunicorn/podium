@@ -1,10 +1,13 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
 import { Play, RefreshCw } from "lucide-react";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { K8sOverview } from "@/components/K8sOverview";
 
 interface Application {
   id: number;
@@ -14,6 +17,16 @@ interface Application {
   version: number;
   created_at: string;
   updated_at: string;
+}
+
+// NamespaceRow mirrors backend/internal/storage.Environment (returned
+// by /api/namespaces). Podium seeds the three defaults in
+// 0001_init.sql; custom namespaces appear after the user deploys to
+// a freeform name (DECISIONS.md C).
+interface NamespaceRow {
+  id: number;
+  name: string;
+  namespace: string;
 }
 
 interface Deployment {
@@ -39,6 +52,8 @@ export function AppDetailPage() {
   const { id } = useParams<{ id: string }>();
   const [app, setApp] = useState<Application | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [namespaces, setNamespaces] = useState<NamespaceRow[]>([]);
+  const [namespace, setNamespace] = useState<string>("podium-dev");
 
   useEffect(() => {
     if (!id) return;
@@ -51,6 +66,17 @@ export function AppDetailPage() {
       }
     })();
   }, [id]);
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        const res = await api.get<{ namespaces: NamespaceRow[] }>("/api/namespaces");
+        setNamespaces(res.namespaces);
+      } catch {
+        // Best-effort — the picker just falls back to the default.
+      }
+    })();
+  }, []);
 
   if (error) {
     return (
@@ -72,7 +98,25 @@ export function AppDetailPage() {
           <h1 className="text-2xl font-semibold">{app.name}</h1>
           <p className="text-sm text-muted-foreground">{app.repository_url}</p>
         </div>
-        <Badge variant="secondary">v{app.version}</Badge>
+        <div className="flex items-center gap-3">
+          <div className="flex items-center gap-2 text-xs text-muted-foreground">
+            <Label htmlFor="ns-picker">Namespace:</Label>
+            <select
+              id="ns-picker"
+              value={namespace}
+              onChange={(e) => setNamespace(e.target.value)}
+              className="rounded-md border border-border bg-background px-2 py-1 font-mono text-xs"
+            >
+              {namespaces.map((n) => (
+                <option key={n.id} value={n.namespace}>
+                  {n.namespace}
+                </option>
+              ))}
+              <option value="__custom__">Other…</option>
+            </select>
+          </div>
+          <Badge variant="secondary">v{app.version}</Badge>
+        </div>
       </div>
 
       <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
@@ -80,11 +124,13 @@ export function AppDetailPage() {
           <CardHeader>
             <CardTitle>Overview</CardTitle>
           </CardHeader>
-          <CardContent className="space-y-2 text-sm">
+          <CardContent className="space-y-3 text-sm">
             <Row label="Container port" value={String(app.container_port)} />
             <Row label="Created" value={new Date(app.created_at).toLocaleString()} />
             <Row label="Updated" value={new Date(app.updated_at).toLocaleString()} />
-            <p className="text-xs text-muted-foreground">Logs and events land here in M5.</p>
+            <div className="border-t border-border pt-3">
+              <K8sOverview appId={app.id} namespace={namespace} />
+            </div>
           </CardContent>
         </Card>
         <Card className="md:col-span-2">
@@ -92,7 +138,7 @@ export function AppDetailPage() {
             <CardTitle>Deployments</CardTitle>
           </CardHeader>
           <CardContent>
-            <DeploymentsTab appId={app.id} />
+            <DeploymentsTab appId={app.id} namespace={namespace} />
           </CardContent>
         </Card>
       </div>
@@ -109,34 +155,55 @@ function Row({ label, value }: { label: string; value: string }) {
   );
 }
 
-function DeploymentsTab({ appId }: { appId: number }) {
+function DeploymentsTab({ appId, namespace }: { appId: number; namespace: string }) {
   const [deployments, setDeployments] = useState<Deployment[] | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [selected, setSelected] = useState<Deployment | null>(null);
+  // Replicas control lives inside the deploy button (1..5 default 3).
+  const [replicas, setReplicas] = useState(3);
+  const [customNs, setCustomNs] = useState("");
+  const showCustomInput = namespace === "__custom__";
+  const effectiveNamespace = useMemo(
+    () => (showCustomInput ? customNs.trim() : namespace),
+    [showCustomInput, customNs, namespace],
+  );
 
   const load = useCallback(async () => {
     try {
       const res = await api.get<{ deployments: Deployment[] }>(
-        `/api/applications/${appId}/deployments`,
+        `/api/applications/${appId}/deployments?namespace=${encodeURIComponent(namespace)}`,
       );
       setDeployments(res.deployments);
     } catch (e) {
       setError((e as Error).message);
     }
-  }, [appId]);
+  }, [appId, namespace]);
 
   useEffect(() => {
     void load();
   }, [load]);
 
   async function deploy() {
+    if (!effectiveNamespace) {
+      setError("Namespace is required");
+      return;
+    }
+    // Client-side DNS-1123 sanity check so the user sees the error
+    // before the request leaves the browser.
+    if (
+      !/^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(effectiveNamespace) ||
+      effectiveNamespace.length > 63
+    ) {
+      setError("Namespace must be DNS-1123 (lowercase, digits, dashes; 1..63 chars).");
+      return;
+    }
     setBusy(true);
     setError(null);
     try {
       const res = await api.post<{ deployment: Deployment }>(`/api/applications/${appId}/deploy`, {
-        namespace: "podium-dev",
-        replicas: 3,
+        namespace: effectiveNamespace,
+        replicas,
       });
       await load();
       setSelected(res.deployment);
@@ -149,14 +216,36 @@ function DeploymentsTab({ appId }: { appId: number }) {
 
   return (
     <div className="space-y-4">
-      <div className="flex items-center justify-between">
+      <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
         <p className="text-xs text-muted-foreground">
-          Each deployment builds a Docker image and (later) rolls it out to a Kubernetes namespace.
+          Each deployment builds a Docker image and rolls it out to the selected namespace.
         </p>
-        <Button size="sm" disabled={busy} onClick={() => void deploy()}>
-          <Play className="h-4 w-4" />
-          {busy ? "Starting…" : "Deploy"}
-        </Button>
+        <div className="flex items-center gap-2">
+          {showCustomInput && (
+            <Input
+              placeholder="custom-namespace"
+              value={customNs}
+              onChange={(e) => setCustomNs(e.target.value)}
+              className="h-8 w-44 font-mono text-xs"
+            />
+          )}
+          <select
+            value={replicas}
+            onChange={(e) => setReplicas(Number(e.target.value))}
+            className="h-8 rounded-md border border-border bg-background px-2 text-xs"
+            aria-label="Replicas"
+          >
+            {[1, 2, 3, 4, 5].map((n) => (
+              <option key={n} value={n}>
+                {n} replica{n > 1 ? "s" : ""}
+              </option>
+            ))}
+          </select>
+          <Button size="sm" disabled={busy} onClick={() => void deploy()}>
+            <Play className="h-4 w-4" />
+            {busy ? "Starting…" : "Deploy"}
+          </Button>
+        </div>
       </div>
 
       {error && <p className="text-sm text-destructive">{error}</p>}
@@ -167,6 +256,9 @@ function DeploymentsTab({ appId }: { appId: number }) {
       )}
       {deployments && deployments.length > 0 && (
         <div className="space-y-3">
+          <p className="text-xs text-muted-foreground">
+            Showing deployments in <span className="font-mono">{namespace}</span>.
+          </p>
           <ul className="divide-y divide-border rounded-md border border-border">
             {deployments.map((d) => (
               <li
