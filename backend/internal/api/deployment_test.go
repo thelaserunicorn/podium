@@ -92,8 +92,16 @@ func newFixture(t *testing.T) *fixture {
 
 	// Seed alice + admin directly so we don't fight the PENDING default.
 	hash, _ := auth.HashPassword("alice-secret")
+	// Pre-seed a dummy user so alice lands on id=2 — same shape as
+	// production where the admin row gets id=1. This catches apps.Get
+	// (id, userID) argument-order swaps in the deploy handler.
+	if _, err := db.ExecContext(ctx,
+		`INSERT INTO users (username, email, password_hash, role, status) VALUES ('seed', 'seed@example.com', ?, 'ADMIN', 'APPROVED')`,
+		hash); err != nil {
+		t.Fatalf("insert seed: %v", err)
+	}
 	res, err := db.ExecContext(ctx,
-		`INSERT INTO users (username, email, password_hash, role, status) VALUES ('alice', 'a', ?, 'USER', 'APPROVED')`,
+		`INSERT INTO users (username, email, password_hash, role, status) VALUES ('alice', 'alice@example.com', ?, 'USER', 'APPROVED')`,
 		hash)
 	if err != nil {
 		t.Fatalf("insert alice: %v", err)

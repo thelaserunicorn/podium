@@ -25,26 +25,26 @@ const (
 
 // Deployment is a single row from the `deployments` table.
 type Deployment struct {
-	ID            int64
-	ApplicationID int64
-	EnvironmentID int64
-	Version       int
-	Image         string
-	Replicas      int
-	Status        DeploymentStatus
-	Reason        sql.NullString
-	CreatedAt     time.Time
-	StartedAt     sql.NullTime
-	FinishedAt    sql.NullTime
+	ID            int64           `json:"id"`
+	ApplicationID int64           `json:"application_id"`
+	EnvironmentID int64           `json:"environment_id"`
+	Version       int             `json:"version"`
+	Image         string          `json:"image"`
+	Replicas      int             `json:"replicas"`
+	Status        DeploymentStatus `json:"status"`
+	Reason        sql.NullString  `json:"reason,omitempty"`
+	CreatedAt     time.Time       `json:"created_at"`
+	StartedAt     sql.NullTime    `json:"started_at,omitempty"`
+	FinishedAt    sql.NullTime    `json:"finished_at,omitempty"`
 }
 
 // LogLine is one row from deploy_log_lines. Returned to the UI for
 // the build-log streaming endpoint.
 type LogLine struct {
-	ID           int64
-	DeploymentID int64
-	TS           time.Time
-	Line         string
+	ID           int64     `json:"id"`
+	DeploymentID int64     `json:"deployment_id"`
+	TS           time.Time `json:"ts"`
+	Line         string    `json:"line"`
 }
 
 // ErrDeploymentBusy is returned when a second deploy for the same app
