@@ -29,7 +29,7 @@ export function LoginPage() {
       const dest = (location.state as { from?: string } | null)?.from ?? "/dashboard";
       navigate(dest, { replace: true });
     } catch (err) {
-      const e = err as { status?: number; message?: string };
+      const e = err as { status?: number; code?: string; message?: string };
       if (e.status === 401) setError("Username or password is incorrect.");
       else if (e.status === 403) setError("Your account is not approved yet.");
       else setError(e.message ?? "Could not sign in.");
