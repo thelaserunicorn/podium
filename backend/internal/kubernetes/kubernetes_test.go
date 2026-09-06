@@ -146,3 +146,26 @@ func TestDeploymentName_Stable(t *testing.T) {
 		t.Errorf("got %q want %q", got, want)
 	}
 }
+
+// TestDeriveKindClusterName: the kubelogin convention is
+// "kind-<cluster>" for the kubeconfig context. Stripping the prefix
+// recovers the kind cluster name so we can pass `--name` to `kind
+// load` and avoid the silent wrong-cluster bug. Contexts that don't
+// follow the convention pass through unchanged — `kind load` will
+// then either succeed (if it matches a real kind cluster) or fail
+// loudly with "cluster not found".
+func TestDeriveKindClusterName(t *testing.T) {
+	t.Parallel()
+	cases := map[string]string{
+		"kind-podium":  "podium",
+		"kind":         "kind",
+		"kind-my-team": "my-team",
+		"orbstack":     "orbstack", // not a kind context — pass through
+		"":             "",
+	}
+	for in, want := range cases {
+		if got := deriveKindClusterName(in); got != want {
+			t.Errorf("deriveKindClusterName(%q)=%q want %q", in, got, want)
+		}
+	}
+}
