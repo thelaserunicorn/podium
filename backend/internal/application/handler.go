@@ -12,22 +12,13 @@ import (
 // Handler exposes the application REST endpoints. The handler depends on
 // Service for all business logic; the only thing it does is parse JSON,
 // pull the authenticated user id from context, and map errors to status.
+// Routing is owned by api.MountApplications.
 type Handler struct {
 	svc *Service
 }
 
 // NewHandler wires the Handler to a Service.
 func NewHandler(svc *Service) *Handler { return &Handler{svc: svc} }
-
-// Mount registers the application routes on mux. The :id placeholder is
-// matched by Go 1.22 net/http (spec.md §33).
-func (h *Handler) Mount(mux *http.ServeMux) {
-	mux.HandleFunc("GET /api/applications", h.list)
-	mux.HandleFunc("POST /api/applications", h.create)
-	mux.HandleFunc("GET /api/applications/{id}", h.get)
-	mux.HandleFunc("PUT /api/applications/{id}", h.update)
-	mux.HandleFunc("DELETE /api/applications/{id}", h.delete)
-}
 
 // ApplicationDTO is the JSON-safe representation of an Application.
 type ApplicationDTO struct {
@@ -67,9 +58,9 @@ type UpdateRequest struct {
 }
 
 // callerUserID is the canonical way handlers ask "who is calling?". It
-// reads the auth.User the WithSession middleware (api package, M1.4) puts
-// in the context. Returns (0, false) when the middleware is not wired —
-// callers map that to 401.
+// reads the auth.User the WithSession middleware (api package) puts in the
+// context. Returns (0, false) when the middleware is not wired — callers
+// map that to 401.
 func callerUserID(r *http.Request) (int64, bool) {
 	u, ok := auth.UserFromContext(r.Context())
 	if !ok {
@@ -104,7 +95,8 @@ func mapErr(w http.ResponseWriter, err error) {
 	}
 }
 
-func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
+// List handles GET /api/applications.
+func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
 	uid, ok := callerUserID(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthenticated", "no session")
@@ -122,7 +114,8 @@ func (h *Handler) list(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"applications": out})
 }
 
-func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
+// Create handles POST /api/applications.
+func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 	uid, ok := callerUserID(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthenticated", "no session")
@@ -146,7 +139,8 @@ func (h *Handler) create(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusCreated, map[string]any{"application": toDTO(a)})
 }
 
-func (h *Handler) get(w http.ResponseWriter, r *http.Request) {
+// Get handles GET /api/applications/{id}.
+func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 	uid, ok := callerUserID(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthenticated", "no session")
@@ -165,7 +159,8 @@ func (h *Handler) get(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"application": toDTO(a)})
 }
 
-func (h *Handler) update(w http.ResponseWriter, r *http.Request) {
+// Update handles PUT /api/applications/{id}.
+func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 	uid, ok := callerUserID(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthenticated", "no session")
@@ -193,7 +188,8 @@ func (h *Handler) update(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"application": toDTO(a)})
 }
 
-func (h *Handler) delete(w http.ResponseWriter, r *http.Request) {
+// Delete handles DELETE /api/applications/{id}.
+func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 	uid, ok := callerUserID(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthenticated", "no session")

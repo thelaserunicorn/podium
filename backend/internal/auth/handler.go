@@ -26,28 +26,20 @@ func UserFromContext(ctx context.Context) (*User, bool) {
 	return &u, true
 }
 
-// withUser returns a new context carrying u. Used by the api middleware.
-func withUser(ctx context.Context, u User) context.Context {
+// WithUser returns a new context carrying u. The api package's session
+// middleware uses this to place the authenticated user in the request context.
+func WithUser(ctx context.Context, u User) context.Context {
 	return context.WithValue(ctx, ctxUser, u)
 }
 
-// Handler exposes the auth HTTP endpoints. It depends only on *Service so
-// the api package (M1.4) can wire it onto the global router.
+// Handler exposes the auth HTTP endpoints. Routing is owned by the api
+// package (see api.MountAuth); this struct holds only the handler functions.
 type Handler struct {
 	svc *Service
 }
 
 // NewHandler wires the Handler to a Service.
 func NewHandler(svc *Service) *Handler { return &Handler{svc: svc} }
-
-// Mount registers the auth routes on mux. Mux routing uses Go 1.22+
-// "METHOD /path" syntax (spec.md §33 + Go 1.22 net/http ServeMux features).
-func (h *Handler) Mount(mux *http.ServeMux) {
-	mux.HandleFunc("POST /api/auth/signup", h.signup)
-	mux.HandleFunc("POST /api/auth/login", h.login)
-	mux.HandleFunc("POST /api/auth/logout", h.logout)
-	mux.HandleFunc("GET  /api/auth/me", h.me)
-}
 
 // SignupRequest is the JSON body of POST /api/auth/signup.
 type SignupRequest struct {
@@ -68,8 +60,7 @@ type MeResponse struct {
 }
 
 // UserDTO is the JSON-safe representation of a User. It deliberately omits
-// password_hash, created_at_iso (we still send it as RFC3339Nano), etc.
-// AGENTS.md §19 / §41.
+// password_hash (AGENTS.md §19, §41).
 type UserDTO struct {
 	ID        int64  `json:"id"`
 	Username  string `json:"username"`
@@ -102,7 +93,8 @@ func writeError(w http.ResponseWriter, status int, code, msg string) {
 	writeJSON(w, status, map[string]string{"error": code, "message": msg})
 }
 
-func (h *Handler) signup(w http.ResponseWriter, r *http.Request) {
+// Signup handles POST /api/auth/signup. Public — no auth required.
+func (h *Handler) Signup(w http.ResponseWriter, r *http.Request) {
 	var req SignupRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_body", "request body must be JSON")
@@ -130,7 +122,8 @@ func (h *Handler) signup(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
+// Login handles POST /api/auth/login. Public — no auth required.
+func (h *Handler) Login(w http.ResponseWriter, r *http.Request) {
 	var req LoginRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
 		writeError(w, http.StatusBadRequest, "invalid_body", "request body must be JSON")
@@ -155,16 +148,18 @@ func (h *Handler) login(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func (h *Handler) logout(w http.ResponseWriter, r *http.Request) {
+// Logout handles POST /api/auth/logout. Always succeeds — clearing a stale
+// session is not an error.
+func (h *Handler) Logout(w http.ResponseWriter, r *http.Request) {
 	tok, _ := CookieFromRequest(r)
 	_ = h.svc.Logout(r.Context(), tok)
 	ClearSessionCookie(w)
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
 }
 
-// me requires the WithSession middleware in front of it (mounted in M1.4).
-// When invoked without a session it returns 401.
-func (h *Handler) me(w http.ResponseWriter, r *http.Request) {
+// Me handles GET /api/auth/me. Requires the WithSession middleware to be
+// in front of it (mounted by api.MountAuth); returns 401 if unauthenticated.
+func (h *Handler) Me(w http.ResponseWriter, r *http.Request) {
 	u, ok := UserFromContext(r.Context())
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthenticated", "no session")
