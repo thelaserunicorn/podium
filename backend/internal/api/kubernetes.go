@@ -21,10 +21,10 @@ import (
 // "cluster not configured" message instead of crashing when KUBECONFIG
 // is missing.
 type K8sHandler struct {
-	store    *storage.Queries
-	apps     *application.Service
-	client   *kubernetes.Client // nil when KUBECONFIG was unavailable at boot
-	logger   *slog.Logger
+	store  *storage.Queries
+	apps   *application.Service
+	client *kubernetes.Client // nil when KUBECONFIG was unavailable at boot
+	logger *slog.Logger
 }
 
 // NewK8sHandler wires the dependencies. client is the real *kubernetes.Client
@@ -49,12 +49,12 @@ func (h *K8sHandler) Mount(mux *http.ServeMux) {
 // Available=false means "the cluster isn't reachable from this process";
 // the rest of the fields are zero values in that case.
 type stateResponse struct {
-	Available       bool                     `json:"available"`
-	Namespace       string                   `json:"namespace"`
-	DeploymentName  string                   `json:"deployment_name"`
-	CurrentReplicas int                      `json:"current_replicas"`
-	DesiredReplicas int                      `json:"desired_replicas"`
-	Pods            []kubernetes.PodSummary  `json:"pods"`
+	Available       bool                    `json:"available"`
+	Namespace       string                  `json:"namespace"`
+	DeploymentName  string                  `json:"deployment_name"`
+	CurrentReplicas int                     `json:"current_replicas"`
+	DesiredReplicas int                     `json:"desired_replicas"`
+	Pods            []kubernetes.PodSummary `json:"pods"`
 }
 
 // GetAppState returns live k8s state for the latest deployment of an
