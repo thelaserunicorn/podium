@@ -193,6 +193,40 @@ func TestApplicationOwnershipIsolated(t *testing.T) {
 	}
 }
 
+// TestApplicationGetByIDIgnoresOwnership: GetByID is the internal-only read
+// the orchestrator + kubernetes.Applier use (no userID available there
+// because the deployment row doesn't carry one). It must succeed across
+// users and return ErrNotFound for unknown ids — but not enforce ownership.
+func TestApplicationGetByIDIgnoresOwnership(t *testing.T) {
+	t.Parallel()
+	ctx, _, appSvc := newCtx(t)
+	alice := testUserA(ctx, appSvc)
+
+	created, err := appSvc.Create(ctx, application.CreateInput{
+		Name:          uniqueName("alice-app"),
+		RepositoryURL: "https://github.com/example/alice",
+		ContainerPort: 8080,
+		UserID:        alice,
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	// GetByID succeeds even when called with the wrong user id (or any).
+	got, err := appSvc.GetByID(ctx, created.ID)
+	if err != nil {
+		t.Fatalf("GetByID: %v", err)
+	}
+	if got.ID != created.ID {
+		t.Fatalf("id mismatch: got %d, want %d", got.ID, created.ID)
+	}
+
+	// Unknown id still returns ErrNotFound.
+	if _, err := appSvc.GetByID(ctx, 99999); !errors.Is(err, application.ErrNotFound) {
+		t.Fatalf("unknown id: want ErrNotFound, got %v", err)
+	}
+}
+
 // TestApplicationNameUniquePerUser: the UNIQUE(user_id, name) constraint
 // should surface as a typed error. Different users with the same app name
 // must both succeed (no global uniqueness).

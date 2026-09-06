@@ -48,8 +48,14 @@ type Applier struct {
 // AppReader is the subset of application.Service that the Applier
 // needs. It is a real interface so tests can pass a fake without
 // depending on the application package's database plumbing.
+//
+// The applier runs in the orchestrator's background goroutine, which
+// has no userID (the deployment row carries the applicationID but not
+// the owner). Ownership has already been authorized by the API handler
+// that created the deployment row, so we use the ownership-free read
+// here — calling Get with userID=0 would always return ErrNotFound.
 type AppReader interface {
-	Get(ctx context.Context, id, userID int64) (application.Application, error)
+	GetByID(ctx context.Context, id int64) (application.Application, error)
 }
 
 func (a *Applier) defaults() {
@@ -72,7 +78,7 @@ func (a *Applier) Apply(ctx context.Context, deploymentID int64) error {
 	if err != nil {
 		return fmt.Errorf("%w: lookup environment: %v", deployment.ErrDeployFailed, err)
 	}
-	app, err := a.App.Get(ctx, d.ApplicationID, 0)
+	app, err := a.App.GetByID(ctx, d.ApplicationID)
 	if err != nil {
 		return fmt.Errorf("kubernetes: load application %d: %w", d.ApplicationID, err)
 	}

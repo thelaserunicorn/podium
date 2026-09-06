@@ -21,7 +21,7 @@ type fakeAppReader struct {
 	err error
 }
 
-func (f *fakeAppReader) Get(_ context.Context, _, _ int64) (application.Application, error) {
+func (f *fakeAppReader) GetByID(_ context.Context, _ int64) (application.Application, error) {
 	return f.app, f.err
 }
 

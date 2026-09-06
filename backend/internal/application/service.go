@@ -137,6 +137,26 @@ func (s *Service) Get(ctx context.Context, id, userID int64) (Application, error
 	return a, nil
 }
 
+// GetByID returns the application identified by id without an ownership
+// check. The deployment orchestrator and the kubernetes.Applier call this
+// after the API handler has already authorized ownership, so the userID
+// gate would be redundant (and would break for admin cross-user reads
+// like the orchestrator background goroutine, which has no userID).
+func (s *Service) GetByID(ctx context.Context, id int64) (Application, error) {
+	row := s.db.QueryRowContext(ctx, `
+		SELECT id, user_id, name, repository_url, container_port, version, created_at, updated_at
+		  FROM applications WHERE id = ?
+	`, id)
+	a, err := scanApplication(row)
+	if errors.Is(err, sql.ErrNoRows) {
+		return Application{}, ErrNotFound
+	}
+	if err != nil {
+		return Application{}, fmt.Errorf("application: select: %w", err)
+	}
+	return a, nil
+}
+
 // List returns every application owned by UserID, ordered by id.
 func (s *Service) List(ctx context.Context, userID int64) ([]Application, error) {
 	rows, err := s.db.QueryContext(ctx, `
