@@ -141,29 +141,8 @@ func (f *fakeRunner) LastCall() (string, []string) {
 }
 
 func TestLoadIntoKind_Success(t *testing.T) {
-	t.Setenv("KIND_CLUSTER_NAME", "")
 	r := &fakeRunner{response: "Image: \"my-api:v1\" kind cluster node(s) loaded image to nodes.\n"}
-	if err := loadIntoKind(context.Background(), r, "my-api:v1"); err != nil {
-		t.Fatalf("unexpected error: %v", err)
-	}
-	name, args := r.LastCall()
-	if name != "kind" {
-		t.Errorf("executable=%q want kind", name)
-	}
-	wantArgs := []string{"load", "docker-image", "my-api:v1"}
-	if !equal(args, wantArgs) {
-		t.Errorf("args=%v want %v", args, wantArgs)
-	}
-}
-
-// TestLoadIntoKind_UsesClusterNameFromEnv verifies that when
-// KIND_CLUSTER_NAME is set, the kind invocation includes
-// `--name <cluster>` so the image lands in the right cluster when
-// the host runs more than one.
-func TestLoadIntoKind_UsesClusterNameFromEnv(t *testing.T) {
-	t.Setenv("KIND_CLUSTER_NAME", "podium")
-	r := &fakeRunner{response: "loaded\n"}
-	if err := loadIntoKind(context.Background(), r, "my-api:v1"); err != nil {
+	if err := loadIntoKind(context.Background(), r, "my-api:v1", "podium"); err != nil {
 		t.Fatalf("unexpected error: %v", err)
 	}
 	name, args := r.LastCall()
@@ -176,9 +155,24 @@ func TestLoadIntoKind_UsesClusterNameFromEnv(t *testing.T) {
 	}
 }
 
+// TestLoadIntoKind_OmitsNameWhenEmpty: an empty cluster name means
+// "let kind pick" — the command must NOT include `--name ""`. This is
+// the single-cluster setup path.
+func TestLoadIntoKind_OmitsNameWhenEmpty(t *testing.T) {
+	r := &fakeRunner{response: "loaded\n"}
+	if err := loadIntoKind(context.Background(), r, "my-api:v1", ""); err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	_, args := r.LastCall()
+	wantArgs := []string{"load", "docker-image", "my-api:v1"}
+	if !equal(args, wantArgs) {
+		t.Errorf("args=%v want %v (no --name flag when cluster name is empty)", args, wantArgs)
+	}
+}
+
 func TestLoadIntoKind_WrapsSubprocessError(t *testing.T) {
 	r := &fakeRunner{response: "ERROR: kind cluster not found\n", err: errors.New("exit 1")}
-	err := loadIntoKind(context.Background(), r, "my-api:v1")
+	err := loadIntoKind(context.Background(), r, "my-api:v1", "podium")
 	if err == nil {
 		t.Fatal("expected error")
 	}
@@ -192,7 +186,7 @@ func TestLoadIntoKind_WrapsSubprocessError(t *testing.T) {
 
 func TestLoadIntoKind_RejectsBadTag(t *testing.T) {
 	r := &fakeRunner{}
-	if err := loadIntoKind(context.Background(), r, "bad tag"); err == nil {
+	if err := loadIntoKind(context.Background(), r, "bad tag", "podium"); err == nil {
 		t.Fatal("expected error on bad tag")
 	}
 	if len(r.calls) != 0 {

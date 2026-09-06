@@ -10,7 +10,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"os/exec"
 	"strings"
 )
@@ -36,10 +35,12 @@ type Builder interface {
 	// tags it `tag`, and writes progress lines to `sink`.
 	Build(ctx context.Context, dir, tag string, sink LogSink) error
 	// LoadIntoKind makes `tag` available to the kind cluster by
-	// shelling out to `kind load docker-image <tag>`. Podium is
-	// assumed to be running on the host with the `kind` CLI on PATH
-	// (DECISIONS.md A).
-	LoadIntoKind(ctx context.Context, tag string) error
+	// shelling out to `kind load docker-image <tag> --name <clusterName>`.
+	// Podium is assumed to be running on the host with the `kind` CLI
+	// on PATH (DECISIONS.md A). Passing the cluster name explicitly
+	// avoids `kind` defaulting to the wrong cluster when the host runs
+	// more than one (the silent-wrong-cluster bug).
+	LoadIntoKind(ctx context.Context, tag, clusterName string) error
 }
 
 // ErrBuildFailed indicates a non-zero exit from the docker build
@@ -103,18 +104,20 @@ func (osRunner) Run(ctx context.Context, name string, args ...string) (string, e
 // and the test fake. The runner does the actual subprocess work; this
 // just formats the command and classifies the error.
 //
-// If KIND_CLUSTER_NAME is set in the environment, the command
-// includes `--name <cluster>` so the image lands in the right
-// cluster (relevant when the host has more than one kind cluster).
-// `kind load` defaults to the only/first cluster when the flag is
-// absent, which is fine for the common single-cluster setup.
-func loadIntoKind(ctx context.Context, runner cmdRunner, tag string) error {
+// `clusterName` is the kind cluster name to target. Pass it
+// explicitly as `--name` so the image lands in the right cluster
+// even when the host runs more than one (without this flag, `kind
+// load` defaults to the only/alphabetically-first cluster, which
+// silently puts the image in the wrong place). Callers derive the
+// name from the kubeconfig current-context via kubernetes.Client;
+// an empty string means "let kind pick" (single-cluster setups).
+func loadIntoKind(ctx context.Context, runner cmdRunner, tag, clusterName string) error {
 	if err := ValidateTag(tag); err != nil {
 		return err
 	}
 	args := []string{"load", "docker-image", tag}
-	if name := os.Getenv("KIND_CLUSTER_NAME"); name != "" {
-		args = append(args, "--name", name)
+	if clusterName != "" {
+		args = append(args, "--name", clusterName)
 	}
 	out, err := runner.Run(ctx, "kind", args...)
 	if err != nil {

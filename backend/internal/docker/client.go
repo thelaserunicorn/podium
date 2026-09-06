@@ -154,9 +154,11 @@ func findBuildError(lines []string) string {
 }
 
 // LoadIntoKind delegates to the shared loadIntoKind with the client's
-// runner.
-func (c *Client) LoadIntoKind(ctx context.Context, tag string) error {
-	return loadIntoKind(ctx, c.runner, tag)
+// runner. `clusterName` is the kind cluster name to target — the
+// kubernetes package passes this through so the image lands in the
+// right cluster even when the host runs more than one.
+func (c *Client) LoadIntoKind(ctx context.Context, tag, clusterName string) error {
+	return loadIntoKind(ctx, c.runner, tag, clusterName)
 }
 
 // drainLines reads from r in a goroutine, splits on newlines, and

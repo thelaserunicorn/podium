@@ -235,11 +235,11 @@ func TestClient_LoadIntoKind_UsesRunner(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := c.LoadIntoKind(context.Background(), "my-api:v1"); err != nil {
+	if err := c.LoadIntoKind(context.Background(), "my-api:v1", "podium"); err != nil {
 		t.Fatal(err)
 	}
 	name, args := r.LastCall()
-	if name != "kind" || !equal(args, []string{"load", "docker-image", "my-api:v1"}) {
+	if name != "kind" || !equal(args, []string{"load", "docker-image", "my-api:v1", "--name", "podium"}) {
 		t.Errorf("runner call: %s %v", name, args)
 	}
 }
