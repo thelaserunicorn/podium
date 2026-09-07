@@ -95,6 +95,7 @@ For step-by-step instructions tailored to your OS:
 - **Pop!_OS / Ubuntu** — [docs/popos-setup.md](./docs/popos-setup.md)
 - **macOS** — [docs/macos-setup.md](./docs/macos-setup.md) (TODO)
 - **Generic Linux** — [docs/ubuntu-setup.md](./docs/ubuntu-setup.md)
+- **Restart-from-cold checklist** — [docs/restart-checklist.md](./docs/restart-checklist.md) (agent-facing runbook for "it's been a while, just get it running")
 
 ## Demo script
 
@@ -200,6 +201,8 @@ See [AGENTS.md §23](./AGENTS.md) for the slice-by-slice workflow.
 - [docs/ubuntu-setup.md](./docs/ubuntu-setup.md) — generic Ubuntu
   runbook
 - [docs/popos-setup.md](./docs/popos-setup.md) — Pop!_OS step-by-step
+- [docs/restart-checklist.md](./docs/restart-checklist.md) — agent-facing
+  restart-from-cold runbook
 - [PUKU.md](./PUKU.md) — AI-assistant guidance
 
 ## Out of scope (deliberately)
