@@ -61,7 +61,10 @@ func run() error {
 	queries := storage.NewQueries(db)
 	// appSvc holds the Queries handle so the dashboard can render the
 	// latest deployment status beside each application. The
-	// orchestrator also receives `queries`.
+	// orchestrator also receives `queries`. The k8s client (if
+	// reachable) is wired as the resource cleaner so DELETE
+	// /api/applications/{id} removes Kubernetes resources alongside
+	// the SQLite row.
 	appSvc := application.NewService(db).WithQueries(queries)
 
 	// Deployment pipeline: docker client (real) + orchestrator. The
@@ -96,6 +99,11 @@ func run() error {
 			App:    appSvc,
 			Loader: deployBuilder,
 		}
+		// Wire the k8s client as the application-service resource
+		// cleaner so DELETE /api/applications/{id} drops the matching
+		// Deployment / Service / ConfigMap / Secret in every namespace
+		// the app touched.
+		appSvc = appSvc.WithResourceCleaner(k8sClient)
 	}
 
 	orch := deployment.NewOrchestrator(
@@ -113,6 +121,7 @@ func run() error {
 	if k8sClient != nil {
 		api.NewK8sHandler(queries, appSvc, k8sClient, logger).Mount(mux)
 		api.NewEnvHandler(queries, appSvc, application.NewEnvService(db, k8sClient), logger).Mount(mux)
+		api.NewLogsHandler(queries, appSvc, k8sClient, logger).Mount(mux)
 	} else {
 		// Still mount with a nil client so /state returns {available:false}.
 		api.NewK8sHandler(queries, appSvc, nil, logger).Mount(mux)
@@ -120,6 +129,10 @@ func run() error {
 		// can still surface and edit env vars (decoupled from the
 		// cluster). The push step is a no-op.
 		api.NewEnvHandler(queries, appSvc, application.NewEnvService(db, nil), logger).Mount(mux)
+		// Logs handler also answers with available:false when the
+		// cluster is missing so the diagnostics tabs render an empty
+		// "cluster not configured" state instead of a connection error.
+		api.NewLogsHandler(queries, appSvc, nil, logger).Mount(mux)
 	}
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

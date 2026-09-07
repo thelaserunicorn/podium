@@ -60,3 +60,27 @@ func podSummaryFrom(p corev1.Pod) PodSummary {
 	}
 	return ps
 }
+
+// PodLogs fetches the current container's stdout/stderr from the
+// Kubernetes API for the named pod. Per DECISIONS.md B this is the
+// "current container" mode (`kubectl logs <pod>` without --previous);
+// the UI polls this on demand and never expects a restart's logs.
+//
+// Follow=false because the UI polls on a button click, not a stream.
+// TailLines bounds the response so a chatty app doesn't ship megabytes
+// through the API. 5000 lines is generous for the diagnostics panel.
+func (c *Client) PodLogs(ctx context.Context, namespace, podName string) (string, error) {
+	if namespace == "" || podName == "" {
+		return "", fmt.Errorf("kubernetes: namespace and pod name are required")
+	}
+	tail := int64(5000)
+	req := c.CS.CoreV1().Pods(namespace).GetLogs(podName, &corev1.PodLogOptions{
+		Follow:    false,
+		TailLines: &tail,
+	})
+	out, err := req.DoRaw(ctx)
+	if err != nil {
+		return "", fmt.Errorf("kubernetes: pod logs %s/%s: %w", namespace, podName, err)
+	}
+	return string(out), nil
+}
