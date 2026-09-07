@@ -40,7 +40,14 @@ func FetchPodLogs(ctx context.Context, src PodLogSource, namespace, podName stri
 		return nil, err
 	}
 	if raw == "" {
-		return nil, nil
+		// Return a non-nil empty slice (not nil) so the API layer's
+		// `encoding/json` round-trip emits `"lines":[]` instead of
+		// `"lines":null`. The Logs tab reads `logs?.lines.length`
+		// directly — a `null` here throws "Cannot read properties of
+		// null (reading 'length')" and the route falls through to the
+		// ErrorBoundary. Same shape as `state.pods` — see kubernetes.go
+		// stateResponse.
+		return []PodLogLine{}, nil
 	}
 	lines := strings.Split(raw, "\n")
 	out := make([]PodLogLine, 0, len(lines))

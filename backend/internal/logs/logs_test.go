@@ -50,13 +50,21 @@ func TestFetchPodLogs_SkipsBlankLines(t *testing.T) {
 }
 
 func TestFetchPodLogs_EmptyBlob(t *testing.T) {
+	// Empty blobs MUST return a non-nil empty slice so the API layer's
+	// `encoding/json` round-trip emits `"lines":[]` instead of
+	// `"lines":null`. The Logs tab reads `logs?.lines.length` directly
+	// and a null here crashes the route — see the /apps/10 Logs tab
+	// incident. Pin the contract here so it can't regress.
 	src := &fakePodLogSource{blob: ""}
 	got, err := FetchPodLogs(context.Background(), src, "podium-dev", "p")
 	if err != nil {
 		t.Fatal(err)
 	}
-	if got != nil {
-		t.Errorf("empty blob should yield nil, got=%+v", got)
+	if got == nil {
+		t.Fatal("empty blob must yield a non-nil empty slice (JSON contract)")
+	}
+	if len(got) != 0 {
+		t.Errorf("empty blob: len=%d want 0", len(got))
 	}
 }
 
