@@ -97,6 +97,14 @@ type osRunner struct{}
 func (osRunner) Run(ctx context.Context, name string, args ...string) (string, error) {
 	cmd := exec.CommandContext(ctx, name, args...)
 	out, err := cmd.CombinedOutput()
+	// If the binary is missing (exec: "git": executable file not found in
+	// $PATH) CombinedOutput returns an empty output buffer and a non-nil
+	// error. Without this glue the caller would see "git clone failed: "
+	// with no clue why. Surface the error message so the orchestrator's
+	// log line tells the operator what actually went wrong.
+	if err != nil && len(out) == 0 {
+		return err.Error(), err
+	}
 	return string(out), err
 }
 

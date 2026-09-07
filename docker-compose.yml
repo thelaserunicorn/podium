@@ -14,8 +14,12 @@
 #     build` into the host's image cache and `kind load docker-image`
 #     into the kind node)
 #
-# The distroless runtime has no shell, so the entrypoint is exec-form
-# straight through to the binary.
+# Plus `network_mode: host` so the bind-mounted kubeconfig's
+# `server: https://127.0.0.1:<kind-port>` URLs resolve correctly.
+# See the service block comment for the trade-off.
+#
+# The runtime image is debian:bookworm-slim with git installed (the
+# orchestrator shells out to `git clone` for every deploy).
 
 services:
   podium:
@@ -25,8 +29,16 @@ services:
     image: podium:dev
     container_name: podium
     restart: unless-stopped
-    ports:
-      - "8080:8080"
+    # host network mode: the container shares the host's network
+    # namespace, so 127.0.0.1 inside the container is the host's
+    # loopback. This is what lets the bind-mounted kubeconfig's
+    # `server: https://127.0.0.1:<kind-port>` URLs resolve correctly
+    # without rewriting them. Without this, Podium would need a
+    # host.docker.internal shim and per-cluster URL rewrites.
+    # Trade-off: no Docker network isolation between Podium and the
+    # host. Acceptable for a single-host demo; do not expose this
+    # compose file to the public internet.
+    network_mode: host
     environment:
       PODIUM_ADDR: ":8080"
       PODIUM_ADMIN_USERNAME: ${PODIUM_ADMIN_USERNAME:-admin}
@@ -35,8 +47,6 @@ services:
       PODIUM_ADMIN_PASSWORD: ${PODIUM_ADMIN_PASSWORD:-change-me-now}
       PODIUM_DB_PATH: /data/podium.db
       PODIUM_SOURCE_ROOT: /data/sources
-      # The distroless user is UID 65532. Mount the kubeconfig so the
-      # path inside the container is predictable regardless of host UID.
       KUBECONFIG: /home/nonroot/.kube/config
     volumes:
       - podium-data:/data
@@ -48,15 +58,6 @@ services:
       # /var/run/docker.sock works without extra_hosts; on Linux it works
       # directly. Reviewers using OrbStack or colima may need to remap.
       - /var/run/docker.sock:/var/run/docker.sock
-    # The Dockerfile sets USER nonroot:nonroot (UID 65532) so the binary
-    # runs as an unprivileged process inside the distroless image. We do
-    # NOT pin `user:` here because the named `podium-data` volume is
-    # created by Docker as UID 0, and the nonroot user can't write into
-    # a root-owned volume mountpoint. The distroless image has no shell
-    # or setuid binaries, so running as root inside the container is
-    # meaningfully safer than in a typical Linux container — but the
-    # bind-mounted docker socket does expose the host root, so don't
-    # expose this compose file to the public internet.
 
 volumes:
   podium-data:
