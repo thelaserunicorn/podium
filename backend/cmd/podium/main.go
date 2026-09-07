@@ -112,9 +112,14 @@ func run() error {
 	api.NewAdminHandler(authSvc).Mount(mux)
 	if k8sClient != nil {
 		api.NewK8sHandler(queries, appSvc, k8sClient, logger).Mount(mux)
+		api.NewEnvHandler(queries, appSvc, application.NewEnvService(db, k8sClient), logger).Mount(mux)
 	} else {
 		// Still mount with a nil client so /state returns {available:false}.
 		api.NewK8sHandler(queries, appSvc, nil, logger).Mount(mux)
+		// EnvService without a k8s writer: storage-only mode so the UI
+		// can still surface and edit env vars (decoupled from the
+		// cluster). The push step is a no-op.
+		api.NewEnvHandler(queries, appSvc, application.NewEnvService(db, nil), logger).Mount(mux)
 	}
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)
