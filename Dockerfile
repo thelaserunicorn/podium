@@ -74,6 +74,18 @@ RUN curl -fsSL "https://download.docker.com/linux/static/stable/x86_64/docker-${
     && rm -rf /tmp/docker /tmp/docker.tgz \
     && docker --version
 
+# kubectl is required by the per-app ingress router
+# (internal/ingress/router.go) which shells out to
+# `kubectl port-forward` for every (app, namespace) the user opens.
+# Pinned to a recent stable v1.32.x matching the kindest/node v1.37.0
+# we know works with our kindest cluster (kindest/node v1.37.0 ships
+# kubectl 1.32 internally; v1.32 client is fine against any 1.30+ API).
+ARG KUBECTL_VERSION=v1.32.0
+RUN curl -fsSL "https://dl.k8s.io/release/${KUBECTL_VERSION}/bin/linux/amd64/kubectl" \
+        -o /usr/local/bin/kubectl \
+    && chmod +x /usr/local/bin/kubectl \
+    && kubectl version --client=true --output=yaml 2>/dev/null | head -3
+
 COPY --from=build /out/podium /app/podium
 
 # Pre-create /data by COPYing a placeholder file. The /data path may
