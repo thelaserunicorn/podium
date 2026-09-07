@@ -56,6 +56,15 @@ export function AppLogsTab({ appId, namespace }: AppLogsTabProps) {
   // Poll the runtime state every 5s so the pod list stays current
   // (a pod that just restarted gets a new name).
   useEffect(() => {
+    // Switching namespaces (or the app itself) means the previous
+    // pod list, error message, and log output are all stale — wipe
+    // them so the new poll's response is what the user sees, not a
+    // half-flash of the previous namespace's data.
+    setState(null);
+    setLogs(null);
+    setSelectedPod(null);
+    setError(null);
+
     let cancelled = false;
     let timer: ReturnType<typeof setTimeout> | null = null;
 
@@ -66,16 +75,35 @@ export function AppLogsTab({ appId, namespace }: AppLogsTabProps) {
           `/api/applications/${appId}/state?namespace=${encodeURIComponent(namespace)}`,
         );
         if (cancelled) return;
-        setState(res);
+        // Defensive: backend always sends pods: [] but never trust the wire.
+        const pods = Array.isArray(res?.pods) ? res.pods : [];
+        const safe: K8sState = {
+          available: !!res?.available,
+          namespace: res?.namespace ?? namespace,
+          pods,
+        };
+        setState(safe);
         // Default-pick the first pod on first load, or whenever the
         // currently-selected pod has vanished (restart).
         setSelectedPod((prev) => {
-          if (prev && res.pods.some((p) => p.name === prev)) return prev;
-          return res.pods[0]?.name ?? null;
+          if (prev && pods.some((p) => p.name === prev)) return prev;
+          return pods[0]?.name ?? null;
         });
+        // Clear stale errors once the app-level state endpoint succeeds.
+        // (e.g. user just deleted + re-created the app; the prior 404
+        // error message shouldn't linger.)
+        setError(null);
       } catch (e) {
         if (cancelled) return;
-        setError((e as Error).message);
+        // 404 = app was deleted out from under us. Surface a friendly
+        // message instead of "404 Not Found" which used to blank the
+        // page in older renders.
+        const msg = (e as { message?: string })?.message ?? "unknown error";
+        if (/404|not[_ ]found/i.test(msg)) {
+          setError("Application no longer exists.");
+        } else {
+          setError(msg);
+        }
       }
       if (cancelled) return;
       timer = setTimeout(loop, 5000);
@@ -96,7 +124,17 @@ export function AppLogsTab({ appId, namespace }: AppLogsTabProps) {
       const res = await api.get<LogsResponse>(
         `/api/applications/${appId}/logs?pod=${encodeURIComponent(selectedPod)}&namespace=${encodeURIComponent(namespace)}`,
       );
-      setLogs(res);
+      // Defensive: backend emits `lines:[]` but never trust the wire —
+      // a future change could go back to nil-slice → null and we don't
+      // want a "Cannot read properties of null (reading 'length')"
+      // crash on the Logs tab (same root cause as the /apps/9 K8sOverview
+      // fix, see kubernetes.go stateResponse).
+      setLogs({
+        available: !!res?.available,
+        namespace: res?.namespace ?? namespace,
+        pod: res?.pod ?? selectedPod,
+        lines: Array.isArray(res?.lines) ? res.lines : [],
+      });
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -130,7 +168,13 @@ export function AppLogsTab({ appId, namespace }: AppLogsTabProps) {
     if (scrollerRef.current) {
       scrollerRef.current.scrollTop = scrollerRef.current.scrollHeight;
     }
-  }, [logs?.lines.length]);
+  }, [logs?.lines?.length]);
+
+  // Defensive defaults so the JSX below never has to handle null
+  // shapes. The state effect above always coerces `pods` to []; this
+  // belt-and-braces fallback is for the brief moment before that
+  // first response lands.
+  const pods = state?.pods ?? [];
 
   if (error && !state) {
     return <p className="text-sm text-destructive">{error}</p>;
@@ -145,7 +189,7 @@ export function AppLogsTab({ appId, namespace }: AppLogsTabProps) {
       </p>
     );
   }
-  if (state.pods.length === 0) {
+  if (pods.length === 0) {
     return (
       <p className="text-sm text-muted-foreground">
         No pods running in <span className="font-mono">{namespace}</span> yet.
@@ -163,7 +207,7 @@ export function AppLogsTab({ appId, namespace }: AppLogsTabProps) {
             onChange={(e) => setSelectedPod(e.target.value || null)}
             className="h-8 rounded-md border border-border bg-background px-2 font-mono text-xs"
           >
-            {state.pods.map((p) => (
+            {pods.map((p) => (
               <option key={p.name} value={p.name}>
                 {p.name}
               </option>

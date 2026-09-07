@@ -66,12 +66,33 @@ export function AppEventsTab({ namespace, deploymentId }: AppEventsTabProps) {
       const res = await api.get<EventsResponse>(
         `/api/deployments/${deploymentId}/events?namespace=${encodeURIComponent(namespace)}`,
       );
-      setEvents(res);
+      // Defensive: backend always sends events: [] but never trust the wire.
+      const safe: EventsResponse = {
+        available: !!res?.available,
+        namespace: res?.namespace ?? namespace,
+        events: Array.isArray(res?.events) ? res.events : [],
+      };
+      setEvents(safe);
     } catch (e) {
-      setError((e as Error).message);
+      // 404 is the common case: the deployment (or app) was deleted
+      // while the user was looking at this tab. Surface a friendly
+      // message instead of "404 Not Found".
+      const msg = (e as { message?: string })?.message ?? "unknown error";
+      if (/404|not[_ ]found/i.test(msg)) {
+        setError("Deployment no longer exists.");
+      } else {
+        setError(msg);
+      }
     } finally {
       setBusy(false);
     }
+  }, [deploymentId, namespace]);
+
+  // Reset state on namespace / deployment switch so the previous
+  // table doesn't linger while the new one loads.
+  useEffect(() => {
+    setEvents(null);
+    setError(null);
   }, [deploymentId, namespace]);
 
   // Poll every 5s while the tab is mounted.

@@ -61,14 +61,36 @@ export function K8sOverview({ appId, namespace }: K8sOverviewProps) {
       const res = await api.get<K8sState>(
         `/api/applications/${appId}/state?namespace=${encodeURIComponent(namespace)}`,
       );
-      setState(res);
+      // Defensive: backend serialises a nil []PodSummary as `null`
+      // (Go's encoding/json behaviour) and we also want to be
+      // resilient to a backend that omits the field entirely.
+      // K8sOverview renders `state.pods.length` so a null or
+      // undefined value here throws "Cannot read properties of null
+      // (reading 'length')" and blanks the whole route via the
+      // ErrorBoundary — see the /apps/9 bug.
+      const safe: K8sState = {
+        available: !!res?.available,
+        namespace: res?.namespace ?? "",
+        deployment_name: res?.deployment_name ?? "",
+        current_replicas: typeof res?.current_replicas === "number" ? res.current_replicas : 0,
+        desired_replicas: typeof res?.desired_replicas === "number" ? res.desired_replicas : 0,
+        pods: Array.isArray(res?.pods) ? res.pods : [],
+      };
+      setState(safe);
       setError(null);
       // Sync the slider to the live desired count the first time we
       // see a real (non-zero) value, so the user doesn't see "0"
       // flickering before the first poll lands.
-      setDesired((prev) => (prev == null && res.available ? res.desired_replicas : prev));
+      setDesired((prev) => (prev == null && safe.available ? safe.desired_replicas : prev));
     } catch (e) {
-      setError((e as Error).message);
+      // 404 = app was deleted out from under us. Surface a friendly
+      // message instead of "404 Not Found".
+      const msg = (e as { message?: string })?.message ?? "unknown error";
+      if (/404|not[_ ]found/i.test(msg)) {
+        setError("Application no longer exists.");
+      } else {
+        setError(msg);
+      }
     }
   }, [appId, namespace]);
 
@@ -94,8 +116,10 @@ export function K8sOverview({ appId, namespace }: K8sOverviewProps) {
   // Reset the slider when the namespace changes so we don't apply
   // the previous-ns replica count to a different namespace.
   useEffect(() => {
+    setState(null);
     setDesired(null);
     setActionError(null);
+    setError(null);
   }, [namespace]);
 
   const scale = async () => {
