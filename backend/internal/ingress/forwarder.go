@@ -263,16 +263,20 @@ func (f *Forwarder) Stop() error {
 // path (forwarder reached readiness) we don't surface kubectl's
 // chatter to the user.
 func (f *Forwarder) watch(stdout, stderr io.ReadCloser, stderrBuf *lineBuffer, ready chan struct{}) {
-	// Line-buffer kubectl's stderr; emit each line at debug.
+	// kubectl writes the readiness line ("Forwarding from 127.0.0.1:<port> -> ...")
+	// to STDOUT, not stderr. We must parse stdout for the marker or Start
+	// will hang until readyTimeout and return a useless "did not become
+	// ready" error. stderr is still drained for diagnostics (real errors
+	// like "NotFound" come on stderr).
+	//
+	// Both streams are line-buffered in parallel so a slow stderr
+	// producer can't back-pressure the kubectl process.
 	go func() {
-		s := bufio.NewScanner(stderr)
+		s := bufio.NewScanner(stdout)
 		s.Buffer(make([]byte, 0, 4096), 64*1024)
 		for s.Scan() {
 			line := s.Text()
-			f.log.Debug("kubectl port-forward", "ns", f.ns, "svc", f.svc, "line", line)
-			if stderrBuf != nil {
-				stderrBuf.append(line)
-			}
+			f.log.Debug("kubectl port-forward stdout", "ns", f.ns, "svc", f.svc, "line", line)
 			if strings.Contains(line, fmt.Sprintf("Forwarding from 127.0.0.1:%d", f.localPort)) {
 				select {
 				case <-ready:
@@ -285,10 +289,17 @@ func (f *Forwarder) watch(stdout, stderr io.ReadCloser, stderrBuf *lineBuffer, r
 		}
 	}()
 
-	// stdout is mostly silent; drain to avoid blocking the subprocess.
-	if stdout != nil {
-		go io.Copy(io.Discard, stdout)
-	}
+	go func() {
+		s := bufio.NewScanner(stderr)
+		s.Buffer(make([]byte, 0, 4096), 64*1024)
+		for s.Scan() {
+			line := s.Text()
+			f.log.Debug("kubectl port-forward stderr", "ns", f.ns, "svc", f.svc, "line", line)
+			if stderrBuf != nil {
+				stderrBuf.append(line)
+			}
+		}
+	}()
 }
 
 // lineBuffer is a small bounded ring of recent lines, used to surface

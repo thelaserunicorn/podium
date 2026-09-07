@@ -14,9 +14,10 @@ import (
 
 // fakeRunner simulates `kubectl port-forward`: it picks a free
 // localhost port, opens a TCP listener, and pipes bytes between any
-// incoming connection and a backend test server. The stderr pipe
+// incoming connection and a backend test server. The stdout pipe
 // emits the readiness line "Forwarding from 127.0.0.1:<port> -> ..."
-// after a configurable delay so tests can exercise the race.
+// after a configurable delay so tests can exercise the race (real
+// kubectl writes this to stdout, not stderr).
 type fakeRunner struct {
 	backend       net.Listener // optional; if nil, the fake just accepts and closes
 	readyDelay    time.Duration
@@ -74,8 +75,9 @@ func (f *fakeRunner) Start(_ context.Context, name string, args ...string) (io.R
 	f.exiteds = append(f.exiteds, exited)
 	f.mu.Unlock()
 
-	// stderr pipe: write the readiness line on a delay (so tests can
-	// race Start against it). Closing the pipe signals subprocess exit.
+	// stdout pipe: write the readiness line on a delay (so tests can
+	// race Start against it). stderr is held open for diagnostics.
+	// Closing the pipe signals subprocess exit.
 	stderrR, stderrW := io.Pipe()
 	stdoutR, stdoutW := io.Pipe()
 
@@ -85,6 +87,13 @@ func (f *fakeRunner) Start(_ context.Context, name string, args ...string) (io.R
 	if f.dieWithStderr != "" {
 		go func() {
 			_, _ = io.WriteString(stderrW, f.dieWithStderr)
+			// Give the watcher's stderr scanner goroutine time to
+			// consume the data and append it to the buffer before we
+			// close stdin/stdout and signal exit. Without this, the
+			// "exited before becoming ready" error path can observe an
+			// empty buffer because the scanner hadn't been scheduled
+			// yet when `<-doneCh` fired.
+			time.Sleep(20 * time.Millisecond)
 			_ = stderrW.Close()
 			_ = stdoutW.Close()
 			close(exited)
@@ -119,9 +128,12 @@ func (f *fakeRunner) Start(_ context.Context, name string, args ...string) (io.R
 
 	go func() {
 		<-time.After(f.readyDelay)
-		_, _ = io.WriteString(stderrW, "Forwarding from 127.0.0.1:"+strconv.Itoa(localPort)+" -> 8080\n")
-		// Hold stderr open until cancel.
+		// Real kubectl writes the readiness line to stdout. The
+		// Forwarder parses stdout for this marker.
+		_, _ = io.WriteString(stdoutW, "Forwarding from 127.0.0.1:"+strconv.Itoa(localPort)+" -> 8080\n")
+		// Hold both pipes open until cancel.
 		<-exited
+		_ = stdoutW.Close()
 		_ = stderrW.Close()
 	}()
 
