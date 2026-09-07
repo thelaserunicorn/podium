@@ -36,6 +36,7 @@ type Deployment struct {
 	CreatedAt     time.Time        `json:"created_at"`
 	StartedAt     sql.NullTime     `json:"started_at,omitempty"`
 	FinishedAt    sql.NullTime     `json:"finished_at,omitempty"`
+	DeletedAt     sql.NullTime     `json:"deleted_at,omitempty"`
 }
 
 // LogLine is one row from deploy_log_lines. Returned to the UI for
@@ -130,16 +131,16 @@ func (q *Queries) GetDeployment(ctx context.Context, id int64) (*Deployment, err
 	}
 	row := q.db.QueryRowContext(ctx, `
 		SELECT id, application_id, environment_id, version, image, replicas,
-		       status, reason, created_at, started_at, finished_at
+		       status, reason, created_at, started_at, finished_at, deleted_at
 		FROM deployments WHERE id = ?
 	`, id)
 	d := &Deployment{}
 	var status string
 	var createdAt string
-	var startedAt, finishedAt sql.NullString
+	var startedAt, finishedAt, deletedAt sql.NullString
 	var reason sql.NullString
 	if err := row.Scan(&d.ID, &d.ApplicationID, &d.EnvironmentID, &d.Version, &d.Image,
-		&d.Replicas, &status, &reason, &createdAt, &startedAt, &finishedAt); err != nil {
+		&d.Replicas, &status, &reason, &createdAt, &startedAt, &finishedAt, &deletedAt); err != nil {
 		return nil, err
 	}
 	d.Status = DeploymentStatus(status)
@@ -157,20 +158,28 @@ func (q *Queries) GetDeployment(ctx context.Context, id int64) (*Deployment, err
 			d.FinishedAt = sql.NullTime{Time: t, Valid: true}
 		}
 	}
+	if deletedAt.Valid {
+		if t, err := parseTS(deletedAt.String); err == nil {
+			d.DeletedAt = sql.NullTime{Time: t, Valid: true}
+		}
+	}
 	return d, nil
 }
 
 // ListDeployments returns the deployment history for an app in a given
-// environment, newest first.
+// environment, newest first. Soft-deleted rows (deleted_at IS NOT NULL)
+// are filtered out so the UI never shows a deployment the user has
+// removed.
 func (q *Queries) ListDeployments(ctx context.Context, appID, envID int64) ([]*Deployment, error) {
 	if q == nil || q.db == nil {
 		return nil, errors.New("storage: queries not initialised")
 	}
 	rows, err := q.db.QueryContext(ctx, `
 		SELECT id, application_id, environment_id, version, image, replicas,
-		       status, reason, created_at, started_at, finished_at
+		       status, reason, created_at, started_at, finished_at, deleted_at
 		FROM deployments
 		WHERE application_id = ? AND environment_id = ?
+		  AND deleted_at IS NULL
 		ORDER BY version DESC
 	`, appID, envID)
 	if err != nil {
@@ -178,15 +187,23 @@ func (q *Queries) ListDeployments(ctx context.Context, appID, envID int64) ([]*D
 	}
 	defer rows.Close()
 
+	return scanDeploymentRows(rows)
+}
+
+// scanDeploymentRows is the shared scan loop for any query that
+// returns the full deployment column list (status, reason, created_at,
+// started_at, finished_at, deleted_at). Centralised so a column add
+// only has to touch one place.
+func scanDeploymentRows(rows *sql.Rows) ([]*Deployment, error) {
 	var out []*Deployment
 	for rows.Next() {
 		d := &Deployment{}
 		var status string
 		var createdAt string
-		var startedAt, finishedAt sql.NullString
+		var startedAt, finishedAt, deletedAt sql.NullString
 		var reason sql.NullString
 		if err := rows.Scan(&d.ID, &d.ApplicationID, &d.EnvironmentID, &d.Version, &d.Image,
-			&d.Replicas, &status, &reason, &createdAt, &startedAt, &finishedAt); err != nil {
+			&d.Replicas, &status, &reason, &createdAt, &startedAt, &finishedAt, &deletedAt); err != nil {
 			return nil, err
 		}
 		d.Status = DeploymentStatus(status)
@@ -204,9 +221,41 @@ func (q *Queries) ListDeployments(ctx context.Context, appID, envID int64) ([]*D
 				d.FinishedAt = sql.NullTime{Time: t, Valid: true}
 			}
 		}
+		if deletedAt.Valid {
+			if t, err := parseTS(deletedAt.String); err == nil {
+				d.DeletedAt = sql.NullTime{Time: t, Valid: true}
+			}
+		}
 		out = append(out, d)
 	}
 	return out, rows.Err()
+}
+
+// SoftDeleteDeployment stamps deleted_at on the row identified by id.
+// Returns sql.ErrNoRows if the row doesn't exist OR is already soft-
+// deleted (the latter is the same shape from the caller's perspective
+// — a row you can't see is a row you can't act on). Does NOT remove
+// any Kubernetes resources; the caller is responsible for that.
+func (q *Queries) SoftDeleteDeployment(ctx context.Context, id int64) error {
+	if q == nil || q.db == nil {
+		return errors.New("storage: queries not initialised")
+	}
+	res, err := q.db.ExecContext(ctx, `
+		UPDATE deployments
+		   SET deleted_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+		 WHERE id = ? AND deleted_at IS NULL
+	`, id)
+	if err != nil {
+		return fmt.Errorf("storage: soft-delete deployment: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("storage: rows affected: %w", err)
+	}
+	if n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 // podTSLayout is the canonical timestamp layout we use throughout
@@ -507,6 +556,41 @@ func (q *Queries) ListEnvironments(ctx context.Context) ([]Environment, error) {
 	return out, rows.Err()
 }
 
+// EnvironmentsForApp returns every (envID, namespace) pair that the
+// app has touched — i.e. every namespace where it has at least one
+// deployment OR one environment_variable row. Used by application
+// deletion to drive the k8s cleanup loop.
+func (q *Queries) EnvironmentsForApp(ctx context.Context, appID int64) ([]Environment, error) {
+	if q == nil || q.db == nil {
+		return nil, errors.New("storage: queries not initialised")
+	}
+	rows, err := q.db.QueryContext(ctx, `
+		SELECT DISTINCT e.id, e.name, e.namespace, e.created_at
+		FROM environments e
+		LEFT JOIN deployments d ON d.environment_id = e.id AND d.application_id = ?
+		LEFT JOIN environment_variables v ON v.environment_id = e.id AND v.application_id = ?
+		WHERE d.id IS NOT NULL OR v.id IS NOT NULL
+		ORDER BY e.id ASC
+	`, appID, appID)
+	if err != nil {
+		return nil, fmt.Errorf("storage: environments for app: %w", err)
+	}
+	defer rows.Close()
+	var out []Environment
+	for rows.Next() {
+		var e Environment
+		var createdAt string
+		if err := rows.Scan(&e.ID, &e.Name, &e.Namespace, &createdAt); err != nil {
+			return nil, err
+		}
+		if t, err := parseTS(createdAt); err == nil {
+			e.CreatedAt = t
+		}
+		out = append(out, e)
+	}
+	return out, rows.Err()
+}
+
 // ApplicationNextVersion bumps the per-application version counter
 // atomically and returns the new value. Uses SQLite's implicit
 // transaction so two concurrent deploys for the same app see distinct
@@ -540,28 +624,30 @@ func (q *Queries) ApplicationNextVersion(ctx context.Context, appID int64) (int,
 // for (appID, envID) excluding the deployment with id `excludeID`. Used
 // by Rollback to discover the image we want to redeploy when the user
 // hasn't named a specific version. Returns sql.ErrNoRows when no
-// successful deployment exists in that namespace yet.
+// successful deployment exists in that namespace yet. Soft-deleted
+// rows are excluded.
 func (q *Queries) LatestSuccessfulDeployment(ctx context.Context, appID, envID, excludeID int64) (*Deployment, error) {
 	if q == nil || q.db == nil {
 		return nil, errors.New("storage: queries not initialised")
 	}
 	row := q.db.QueryRowContext(ctx, `
 		SELECT id, application_id, environment_id, version, image, replicas,
-		       status, reason, created_at, started_at, finished_at
+		       status, reason, created_at, started_at, finished_at, deleted_at
 		FROM deployments
 		WHERE application_id = ? AND environment_id = ?
 		  AND status = 'RUNNING'
 		  AND id <> ?
+		  AND deleted_at IS NULL
 		ORDER BY version DESC, id DESC
 		LIMIT 1
 	`, appID, envID, excludeID)
 	d := &Deployment{}
 	var status string
 	var createdAt string
-	var startedAt, finishedAt sql.NullString
+	var startedAt, finishedAt, deletedAt sql.NullString
 	var reason sql.NullString
 	if err := row.Scan(&d.ID, &d.ApplicationID, &d.EnvironmentID, &d.Version, &d.Image,
-		&d.Replicas, &status, &reason, &createdAt, &startedAt, &finishedAt); err != nil {
+		&d.Replicas, &status, &reason, &createdAt, &startedAt, &finishedAt, &deletedAt); err != nil {
 		return nil, err
 	}
 	d.Status = DeploymentStatus(status)
@@ -585,24 +671,26 @@ func (q *Queries) LatestSuccessfulDeployment(ctx context.Context, appID, envID, 
 // DeploymentAtVersion returns the deployment for (appID, envID, version)
 // or sql.ErrNoRows if no such row exists. Used by Rollback to look up
 // the exact target image when the user picks a specific prior version.
+// Soft-deleted rows are excluded.
 func (q *Queries) DeploymentAtVersion(ctx context.Context, appID, envID int64, version int) (*Deployment, error) {
 	if q == nil || q.db == nil {
 		return nil, errors.New("storage: queries not initialised")
 	}
 	row := q.db.QueryRowContext(ctx, `
 		SELECT id, application_id, environment_id, version, image, replicas,
-		       status, reason, created_at, started_at, finished_at
+		       status, reason, created_at, started_at, finished_at, deleted_at
 		FROM deployments
 		WHERE application_id = ? AND environment_id = ? AND version = ?
+		  AND deleted_at IS NULL
 		LIMIT 1
 	`, appID, envID, version)
 	d := &Deployment{}
 	var status string
 	var createdAt string
-	var startedAt, finishedAt sql.NullString
+	var startedAt, finishedAt, deletedAt sql.NullString
 	var reason sql.NullString
 	if err := row.Scan(&d.ID, &d.ApplicationID, &d.EnvironmentID, &d.Version, &d.Image,
-		&d.Replicas, &status, &reason, &createdAt, &startedAt, &finishedAt); err != nil {
+		&d.Replicas, &status, &reason, &createdAt, &startedAt, &finishedAt, &deletedAt); err != nil {
 		return nil, err
 	}
 	d.Status = DeploymentStatus(status)
