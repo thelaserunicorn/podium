@@ -419,7 +419,10 @@ var sharedFake *fakeRunner
 
 func sharedFakeRunner() *fakeRunner {
 	sharedFakeOnce.Do(func() {
-		sharedFake = &fakeRunner{readyDelay: 5 * time.Millisecond}
+		sharedFake = &fakeRunner{
+			readyDelay:    5 * time.Millisecond,
+			readyListener: true, // Router tests need DialContext to succeed
+		}
 	})
 	return sharedFake
 }

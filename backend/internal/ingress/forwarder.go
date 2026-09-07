@@ -134,10 +134,25 @@ func (f *Forwarder) Start(ctx context.Context) error {
 		return fmt.Errorf("ingress: start kubectl port-forward: %w", err)
 	}
 
-	// doneCh is closed exactly once when the subprocess exits.
+	// doneCh is closed exactly once when either:
+	//   - the subprocess exits on its own (runner closes `exited`), OR
+	//   - the caller invokes Cancel().
+	//
+	// We achieve that by wrapping cancel in a function that also
+	// closes doneCh; the bridge goroutine waits on `exited` and
+	// closes doneCh on natural exit.
 	doneCh := make(chan struct{})
+	wrappedCancel := func() {
+		cancel()
+		select {
+		case <-doneCh:
+			// already closed (by natural exit)
+		default:
+			close(doneCh)
+		}
+	}
 	cmd := &runningCmd{
-		Cancel: cancel,
+		Cancel: wrappedCancel,
 		Done:   doneCh,
 	}
 
@@ -145,7 +160,12 @@ func (f *Forwarder) Start(ctx context.Context) error {
 	// close doneCh so subsequent Dial/Stop calls see the dead state.
 	go func() {
 		<-exited
-		close(doneCh)
+		select {
+		case <-doneCh:
+			// already closed (by wrappedCancel)
+		default:
+			close(doneCh)
+		}
 	}()
 
 	f.mu.Lock()

@@ -21,8 +21,17 @@ type fakeRunner struct {
 	backend       net.Listener // optional; if nil, the fake just accepts and closes
 	readyDelay    time.Duration
 	startFailNext bool
+	// dialUpstream, if set, makes proxyConn dial this address instead
+	// of using `backend`. Proxy tests use this to point the fake at
+	// an httptest.Server.
+	dialUpstream  string
+	// readyListener, if true, makes the fake use a real TCP listener
+	// on the requested local port (so DialContext succeeds).
+	// Otherwise the fake just emits the readiness line and returns
+	// the channel — DialContext would fail because nothing is listening.
+	readyListener bool
 
-	mu     sync.Mutex
+	mu      sync.Mutex
 	cancels []context.CancelFunc
 	exiteds []chan struct{}
 }
@@ -46,9 +55,13 @@ func (f *fakeRunner) Start(_ context.Context, name string, args ...string) (io.R
 		return nil, nil, nil, nil, errors.New("fake: could not parse local port")
 	}
 
-	ln, err := net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(localPort))
-	if err != nil {
-		return nil, nil, nil, nil, err
+	var ln net.Listener
+	var err error
+	if f.readyListener || f.backend != nil || f.dialUpstream != "" {
+		ln, err = net.Listen("tcp", "127.0.0.1:"+strconv.Itoa(localPort))
+		if err != nil {
+			return nil, nil, nil, nil, err
+		}
 	}
 
 	exited := make(chan struct{})
@@ -62,9 +75,21 @@ func (f *fakeRunner) Start(_ context.Context, name string, args ...string) (io.R
 	stdoutR, stdoutW := io.Pipe()
 
 	cancel := func() {
-		_ = ln.Close()
+		if ln != nil {
+			_ = ln.Close()
+		}
 		_ = stderrW.Close()
 		_ = stdoutW.Close()
+		// Close `exited` so the Forwarder's bridge goroutine can move
+		// on. Tests that don't close it via ln-close will still get
+		// `exited` closed when the stderr/stdout drain goroutines
+		// hit EOF, but in practice the explicit close is what callers
+		// depend on. Idempotent via the `select`.
+		select {
+		case <-exited:
+		default:
+			close(exited)
+		}
 	}
 
 	go func() {
@@ -75,16 +100,28 @@ func (f *fakeRunner) Start(_ context.Context, name string, args ...string) (io.R
 		_ = stderrW.Close()
 	}()
 
-	go func() {
-		defer close(exited)
-		for {
-			c, err := ln.Accept()
-			if err != nil {
-				return
+	if ln != nil {
+		go func() {
+			defer close(exited)
+			for {
+				c, err := ln.Accept()
+				if err != nil {
+					return
+				}
+				go f.proxyConn(c)
 			}
-			go f.proxyConn(c)
-		}
-	}()
+		}()
+	} else {
+		// No listener (test fake). The Forwarder's bridge goroutine
+		// waits on `<-exited`. We don't close it here — the test
+		// calls cancel() which closes stderr and exits the readiness
+		// goroutine; without ln.Accept() there's no other goroutine
+		// that would close exited. Tests using this mode must Stop()
+		// the forwarder explicitly.
+		go func() {
+			<-exited // never fires unless something closes it
+		}()
+	}
 
 	f.mu.Lock()
 	f.cancels = append(f.cancels, cancel)
@@ -95,15 +132,23 @@ func (f *fakeRunner) Start(_ context.Context, name string, args ...string) (io.R
 
 func (f *fakeRunner) proxyConn(c net.Conn) {
 	defer c.Close()
-	if f.backend != nil {
-		upstream, err := net.Dial("tcp", f.backend.Addr().String())
-		if err != nil {
-			return
-		}
-		defer upstream.Close()
-		go io.Copy(upstream, c)
-		io.Copy(c, upstream)
+
+	var upstream net.Conn
+	var err error
+	switch {
+	case f.dialUpstream != "":
+		upstream, err = net.Dial("tcp", f.dialUpstream)
+	case f.backend != nil:
+		upstream, err = net.Dial("tcp", f.backend.Addr().String())
+	default:
+		return
 	}
+	if err != nil {
+		return
+	}
+	defer upstream.Close()
+	go io.Copy(upstream, c)
+	io.Copy(c, upstream)
 }
 
 func (f *fakeRunner) KillAll() {
