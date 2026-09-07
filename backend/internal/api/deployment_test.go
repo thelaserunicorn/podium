@@ -327,6 +327,7 @@ type recordingApplier struct {
 	mu       sync.Mutex
 	scales   []scaleCall
 	restarts []restartCall
+	applies  []int64 // deployment IDs handed to Apply (rollback path)
 	err      error
 }
 
@@ -341,7 +342,12 @@ type restartCall struct {
 	ns  string
 }
 
-func (r *recordingApplier) Apply(_ context.Context, _ int64) error { return nil }
+func (r *recordingApplier) Apply(_ context.Context, id int64) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.applies = append(r.applies, id)
+	return r.err
+}
 
 func (r *recordingApplier) Scale(_ context.Context, app *application.Application, ns string, replicas int) error {
 	r.mu.Lock()
@@ -551,3 +557,207 @@ func jsonNumber(i int64) string {
 type nopFetcher struct{}
 
 func (nopFetcher) Fetch(_ context.Context, _, _ string) error { return nil }
+
+// rollbackFixture wires a fixture where a real applier is reachable AND
+// four prior RUNNING deployments already exist in podium-dev. The
+// returned depIDs[3] is the latest successful — passing it as the URL
+// id for POST /rollback is the common "roll back to v3" happy path.
+//
+// The returned deploymentID is the id of the latest row in the
+// history; the Rollback handler reads its (app, env) so we don't have
+// to duplicate the resolution in every test.
+func rollbackFixture(t *testing.T, applier *recordingApplier) (*fixture, []int64) {
+	t.Helper()
+	f := fixtureWithApplier(t, applier)
+
+	ctx := context.Background()
+	envID, err := f.store.EnvironmentIDByNamespace(ctx, "podium-dev")
+	if err != nil {
+		t.Fatal(err)
+	}
+	depIDs := make([]int64, 0, 4)
+	for v := 1; v <= 4; v++ {
+		id, err := f.store.CreateDeployment(ctx, f.appID, envID, v, 3, fmt.Sprintf("my-api:v%d", v))
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := f.store.SetDeploymentStatus(ctx, id, storage.StatusRunning, ""); err != nil {
+			t.Fatal(err)
+		}
+		// Mirror what ApplicationNextVersion would do so the post-rollback
+		// version lands at 5 instead of starting the counter at 0.
+		if _, err := f.store.DB().ExecContext(ctx,
+			`UPDATE applications SET version = ? WHERE id = ?`, v, f.appID); err != nil {
+			t.Fatal(err)
+		}
+		depIDs = append(depIDs, id)
+	}
+	return f, depIDs
+}
+
+// TestRollback_HappyPathForwardsToApplier and friends. We exercise the
+// handler around a depID that belongs to one of alice's apps (the one
+// newFixture creates).
+func TestRollback_HappyPathForwardsToApplier(t *testing.T) {
+	applier := &recordingApplier{}
+	f, depIDs := rollbackFixture(t, applier)
+
+	// Rollback the newest deployment row. Per-namespace scope means
+	// the request body doesn't carry the namespace; the handler picks
+	// env from the existing row.
+	body := bytes.NewBufferString(`{}`)
+	req := httptest.NewRequest("POST", "/api/deployments/"+itoa(depIDs[3])+"/rollback", body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Cookie", f.cookie)
+	rec := httptest.NewRecorder()
+	f.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("rollback: %d %s", rec.Code, rec.Body.String())
+	}
+	var resp deployResponse
+	_ = json.NewDecoder(rec.Body).Decode(&resp)
+	if resp.Deployment == nil {
+		t.Fatal("no deployment in response")
+	}
+	// target_version=0 → image reuses the most recent successful row's bytes.
+	if resp.Deployment.Image != "my-api:v4" {
+		t.Errorf("image=%q want my-api:v4", resp.Deployment.Image)
+	}
+	if resp.Deployment.Version != 5 {
+		t.Errorf("version=%d want 5 (counter bumped from 4)", resp.Deployment.Version)
+	}
+	if resp.Deployment.Status != storage.StatusDeploying && resp.Deployment.Status != storage.StatusStarting && resp.Deployment.Status != storage.StatusRunning {
+		t.Errorf("status=%q want DEPLOYING/STARTING/RUNNING", resp.Deployment.Status)
+	}
+
+	applier.mu.Lock()
+	defer applier.mu.Unlock()
+	if len(applier.applies) != 1 {
+		t.Fatalf("applies=%d want 1", len(applier.applies))
+	}
+	if applier.applies[0] != resp.Deployment.ID {
+		t.Errorf("applies[0]=%d want %d", applier.applies[0], resp.Deployment.ID)
+	}
+}
+
+func TestRollback_ToSpecificVersion(t *testing.T) {
+	applier := &recordingApplier{}
+	f, depIDs := rollbackFixture(t, applier)
+
+	body := bytes.NewBufferString(`{"target_version":2}`)
+	req := httptest.NewRequest("POST", "/api/deployments/"+itoa(depIDs[3])+"/rollback", body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Cookie", f.cookie)
+	rec := httptest.NewRecorder()
+	f.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("rollback: %d %s", rec.Code, rec.Body.String())
+	}
+	var resp deployResponse
+	_ = json.NewDecoder(rec.Body).Decode(&resp)
+	if resp.Deployment.Image != "my-api:v2" {
+		t.Errorf("image=%q want my-api:v2", resp.Deployment.Image)
+	}
+	if resp.Deployment.Version != 5 {
+		t.Errorf("version=%d want 5", resp.Deployment.Version)
+	}
+}
+
+func TestRollback_UnknownVersionReturns400(t *testing.T) {
+	applier := &recordingApplier{}
+	f, depIDs := rollbackFixture(t, applier)
+
+	body := bytes.NewBufferString(`{"target_version":999}`)
+	req := httptest.NewRequest("POST", "/api/deployments/"+itoa(depIDs[3])+"/rollback", body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Cookie", f.cookie)
+	rec := httptest.NewRecorder()
+	f.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("rollback: %d %s want 400", rec.Code, rec.Body.String())
+	}
+	if !strings.Contains(rec.Body.String(), "unknown_target_version") {
+		t.Errorf("body=%q want unknown_target_version", rec.Body.String())
+	}
+}
+
+func TestRollback_NoSuccessfulReturns400(t *testing.T) {
+	applier := &recordingApplier{}
+	f, depIDs := rollbackFixture(t, applier)
+	// Mark every seeded row FAILED so LatestSuccessfulDeployment
+	// returns sql.ErrNoRows → the handler should surface 400.
+	for _, id := range depIDs {
+		if err := f.store.SetDeploymentStatus(context.Background(), id, storage.StatusFailed, "boom"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	body := bytes.NewBufferString(`{}`)
+	req := httptest.NewRequest("POST", "/api/deployments/"+itoa(depIDs[3])+"/rollback", body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Cookie", f.cookie)
+	rec := httptest.NewRecorder()
+	f.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("rollback: %d %s want 400", rec.Code, rec.Body.String())
+	}
+}
+
+func TestRollback_RequiresAuth(t *testing.T) {
+	applier := &recordingApplier{}
+	f, depIDs := rollbackFixture(t, applier)
+
+	body := bytes.NewBufferString(`{}`)
+	req := httptest.NewRequest("POST", "/api/deployments/"+itoa(depIDs[3])+"/rollback", body)
+	req.Header.Set("Content-Type", "application/json")
+	// no cookie
+	rec := httptest.NewRecorder()
+	f.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("got %d want 401", rec.Code)
+	}
+}
+
+func TestRollback_NotFoundWhenCrossUserDeployment(t *testing.T) {
+	applier := &recordingApplier{}
+	f, _ := rollbackFixture(t, applier)
+
+	// Insert a deployment for a *different* user's app. The handler
+	// must surface 404 (we never leak existence — AGENTS.md §19).
+	db := f.store.DB()
+	res, _ := db.ExecContext(context.Background(),
+		`INSERT INTO users (username, email, password_hash, role, status) VALUES ('bob','bob@x','x','USER','APPROVED')`)
+	bobID, _ := res.LastInsertId()
+	res, _ = db.ExecContext(context.Background(),
+		`INSERT INTO applications (user_id, name, repository_url, container_port) VALUES (?,'bob-app','https://github.com/x/y',80)`,
+		bobID)
+	bobAppID, _ := res.LastInsertId()
+	envID, _ := f.store.EnvironmentIDByNamespace(context.Background(), "podium-dev")
+	bobDepID, _ := f.store.CreateDeployment(context.Background(), bobAppID, envID, 1, 1, "bob-app:v1")
+	f.store.SetDeploymentStatus(context.Background(), bobDepID, storage.StatusRunning, "")
+
+	body := bytes.NewBufferString(`{}`)
+	req := httptest.NewRequest("POST", "/api/deployments/"+itoa(bobDepID)+"/rollback", body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Cookie", f.cookie)
+	rec := httptest.NewRecorder()
+	f.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("got %d want 404 (don't leak existence)", rec.Code)
+	}
+}
+
+func TestRollback_NegativeTargetVersionReturns400(t *testing.T) {
+	applier := &recordingApplier{}
+	f, depIDs := rollbackFixture(t, applier)
+
+	body := bytes.NewBufferString(`{"target_version":-1}`)
+	req := httptest.NewRequest("POST", "/api/deployments/"+itoa(depIDs[3])+"/rollback", body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Cookie", f.cookie)
+	rec := httptest.NewRecorder()
+	f.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("got %d want 400", rec.Code)
+	}
+}

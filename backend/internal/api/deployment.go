@@ -49,6 +49,7 @@ func (h *DeploymentHandler) Mount(mux *http.ServeMux) {
 	mux.Handle("GET /api/deployments/{id}", wrapped(h.GetDeployment))
 	mux.Handle("GET /api/applications/{id}/deployments", wrapped(h.ListDeployments))
 	mux.Handle("GET /api/deployments/{id}/logs", wrapped(h.GetLogs))
+	mux.Handle("POST /api/deployments/{id}/rollback", wrapped(h.Rollback))
 }
 
 // deployRequest is the JSON body for POST /api/applications/{id}/deploy.
@@ -361,6 +362,105 @@ func (h *DeploymentHandler) Restart(w http.ResponseWriter, r *http.Request) {
 		"deployment_name": depName,
 		"restarted_at":    storage.FormatPodTS(time.Now()),
 	})
+}
+
+// rollbackRequest is the JSON body for POST /api/deployments/{id}/rollback.
+// target_version=0 means "the most recent successful deployment in this
+// app+namespace pair". Any positive integer means "that exact version".
+type rollbackRequest struct {
+	TargetVersion int `json:"target_version"`
+}
+
+// Rollback handles POST /api/deployments/{id}/rollback. It redeploys a
+// prior image in the same namespace as the supplied deployment without
+// rebuilding (DECISIONS.md D). The new row gets a fresh version counter
+// (per-app monotonic) but its image bytes are the target's.
+//
+// Returns:
+//   - 201 Created with { deployment } on success.
+//   - 400 for an unknown target version.
+//   - 404 if the deployment doesn't exist or belongs to another user.
+//   - 409 if another deployment is already in flight for this
+//     app+namespace pair (mirrors POST /deploy's behaviour).
+func (h *DeploymentHandler) Rollback(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	deploymentID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+	d, err := h.store.GetDeployment(r.Context(), deploymentID)
+	if err != nil {
+		if errors.Is(err, sql.ErrNoRows) {
+			writeJSONError(w, http.StatusNotFound, "deployment not found")
+			return
+		}
+		h.logger.Error("get deployment", "err", err)
+		writeJSONError(w, http.StatusInternalServerError, "internal_error")
+		return
+	}
+	// Authorize: deployment belongs to one of the caller's apps. We
+	// never leak existence (AGENTS.md §19) — a wrong-owner lookup
+	// surfaces as 404 too.
+	app, err := h.apps.Get(r.Context(), d.ApplicationID, user.ID)
+	if err != nil {
+		writeJSONError(w, http.StatusNotFound, "deployment not found")
+		return
+	}
+
+	var req rollbackRequest
+	if r.ContentLength > 0 {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid json")
+			return
+		}
+	}
+	if req.TargetVersion < 0 {
+		writeJSONError(w, http.StatusBadRequest, "target_version must be >= 0")
+		return
+	}
+
+	// Reject concurrent rollback when there's already an active
+	// deployment in the same (app, namespace) pair. Without this,
+	// two simultaneous "Roll back" clicks would race the version
+	// counter and create duplicate rows.
+	active, err := h.store.HasActiveDeployment(r.Context(), app.ID, d.EnvironmentID)
+	if err != nil {
+		h.logger.Error("check active deployment", "err", err)
+		writeJSONError(w, http.StatusInternalServerError, "internal_error")
+		return
+	}
+	if active {
+		writeJSONError(w, http.StatusConflict, "deployment_already_in_progress")
+		return
+	}
+
+	rollbackID, err := h.orch.Rollback(r.Context(), &app, d.EnvironmentID, req.TargetVersion)
+	if err != nil {
+		// LatestSuccessfulDeployment / DeploymentAtVersion return
+		// sql.ErrNoRows when the target is missing — surface that as
+		// a 400 ("unknown version") so the UI can show a friendly
+		// error rather than 500.
+		if errors.Is(err, sql.ErrNoRows) {
+			writeJSONError(w, http.StatusBadRequest, "unknown_target_version")
+			return
+		}
+		h.logger.Error("rollback deployment", "err", err, "deployment_id", deploymentID, "target_version", req.TargetVersion)
+		writeJSONError(w, http.StatusBadGateway, "rollback_failed: "+err.Error())
+		return
+	}
+
+	newDep, err := h.store.GetDeployment(r.Context(), rollbackID)
+	if err != nil {
+		h.logger.Error("read back rollback deployment", "err", err)
+		writeJSONError(w, http.StatusInternalServerError, "internal_error")
+		return
+	}
+	writeJSON(w, http.StatusCreated, deployResponse{Deployment: newDep})
 }
 
 // ListDeployments returns the deployment history for an app in a
