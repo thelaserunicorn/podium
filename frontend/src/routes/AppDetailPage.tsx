@@ -8,6 +8,7 @@ import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { K8sOverview } from "@/components/K8sOverview";
+import { EnvVarsPanel } from "@/components/EnvVarsPanel";
 
 interface Application {
   id: number;
@@ -54,6 +55,7 @@ export function AppDetailPage() {
   const [error, setError] = useState<string | null>(null);
   const [namespaces, setNamespaces] = useState<NamespaceRow[]>([]);
   const [namespace, setNamespace] = useState<string>("podium-dev");
+  const [tab, setTab] = useState<"overview" | "deployments" | "env">("overview");
 
   useEffect(() => {
     if (!id) return;
@@ -119,21 +121,60 @@ export function AppDetailPage() {
         </div>
       </div>
 
-      <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+      <div className="border-b border-border">
+        <nav className="flex gap-1" aria-label="Tabs">
+          {(
+            [
+              ["overview", "Overview"],
+              ["deployments", "Deployments"],
+              ["env", "Env vars"],
+            ] as const
+          ).map(([key, label]) => (
+            <button
+              key={key}
+              type="button"
+              onClick={() => setTab(key)}
+              className={`border-b-2 px-3 py-2 text-sm transition-colors ${
+                tab === key
+                  ? "border-foreground text-foreground"
+                  : "border-transparent text-muted-foreground hover:text-foreground"
+              }`}
+              aria-current={tab === key ? "page" : undefined}
+            >
+              {label}
+            </button>
+          ))}
+        </nav>
+      </div>
+
+      {tab === "overview" && (
+        <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+          <Card>
+            <CardHeader>
+              <CardTitle>Overview</CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-3 text-sm">
+              <Row label="Container port" value={String(app.container_port)} />
+              <Row label="Created" value={new Date(app.created_at).toLocaleString()} />
+              <Row label="Updated" value={new Date(app.updated_at).toLocaleString()} />
+              <div className="border-t border-border pt-3">
+                <K8sOverview appId={app.id} namespace={namespace} />
+              </div>
+            </CardContent>
+          </Card>
+          <Card className="md:col-span-2">
+            <CardHeader>
+              <CardTitle>Recent activity</CardTitle>
+            </CardHeader>
+            <CardContent className="text-sm text-muted-foreground">
+              Switch to the Deployments tab to see history and start a new deploy.
+            </CardContent>
+          </Card>
+        </div>
+      )}
+
+      {tab === "deployments" && (
         <Card>
-          <CardHeader>
-            <CardTitle>Overview</CardTitle>
-          </CardHeader>
-          <CardContent className="space-y-3 text-sm">
-            <Row label="Container port" value={String(app.container_port)} />
-            <Row label="Created" value={new Date(app.created_at).toLocaleString()} />
-            <Row label="Updated" value={new Date(app.updated_at).toLocaleString()} />
-            <div className="border-t border-border pt-3">
-              <K8sOverview appId={app.id} namespace={namespace} />
-            </div>
-          </CardContent>
-        </Card>
-        <Card className="md:col-span-2">
           <CardHeader>
             <CardTitle>Deployments</CardTitle>
           </CardHeader>
@@ -141,7 +182,18 @@ export function AppDetailPage() {
             <DeploymentsTab appId={app.id} namespace={namespace} />
           </CardContent>
         </Card>
-      </div>
+      )}
+
+      {tab === "env" && (
+        <Card>
+          <CardHeader>
+            <CardTitle>Environment variables</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <EnvVarsPanel appId={app.id} namespace={namespace} />
+          </CardContent>
+        </Card>
+      )}
     </div>
   );
 }
