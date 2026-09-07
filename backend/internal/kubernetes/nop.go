@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 
+	"github.com/podium/podium/internal/application"
 	"github.com/podium/podium/internal/deployment"
 )
 
@@ -15,6 +16,10 @@ import (
 // error>". This mirrors the docker NopBuilder/NopFetcher pattern from
 // M2 — boot never blocks on infrastructure the user hasn't set up
 // yet.
+//
+// Scale and Restart follow the same pattern: when no k8s client is
+// available they return the underlying error (or ErrDeployFailed)
+// rather than silently succeeding.
 type NopApplier struct {
 	Err error
 }
@@ -23,6 +28,20 @@ type NopApplier struct {
 // (when set) so classifyReason surfaces the reason string and the
 // underlying kubeconfig error in the log stream.
 func (n NopApplier) Apply(_ context.Context, _ int64) error {
+	if n.Err == nil {
+		return deployment.ErrDeployFailed
+	}
+	return fmt.Errorf("%w: %v", deployment.ErrDeployFailed, n.Err)
+}
+
+func (n NopApplier) Scale(_ context.Context, _ *application.Application, _ string, _ int) error {
+	if n.Err == nil {
+		return deployment.ErrDeployFailed
+	}
+	return fmt.Errorf("%w: %v", deployment.ErrDeployFailed, n.Err)
+}
+
+func (n NopApplier) Restart(_ context.Context, _ *application.Application, _ string) error {
 	if n.Err == nil {
 		return deployment.ErrDeployFailed
 	}

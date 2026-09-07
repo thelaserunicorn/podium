@@ -121,6 +121,33 @@ func (a *Applier) Apply(ctx context.Context, deploymentID int64) error {
 	return a.waitReady(ctx, deploymentID, env.Namespace, depName, d.Replicas)
 }
 
+// Scale is the deployment.K8sApplier entry point for changing the
+// replica count of an existing Deployment (M4). The API handler has
+// already authorized ownership and validated the namespace + replica
+// range, so we only need to translate the k8s client error into the
+// deploy-failed sentinel so classifyReason maps it to the right
+// reason string.
+func (a *Applier) Scale(ctx context.Context, app *application.Application, namespace string, replicas int) error {
+	depName := DeploymentName(app.Name, app.ID)
+	if err := a.Client.ScaleDeployment(ctx, namespace, depName, replicas); err != nil {
+		return fmt.Errorf("%w: scale: %v", deployment.ErrDeployFailed, err)
+	}
+	return nil
+}
+
+// Restart is the deployment.K8sApplier entry point for restarting a
+// running app. We delete every pod that matches the app's label
+// selector; the Deployment controller recreates them. Empty result
+// (no pods to delete) is success — restart against a fresh namespace
+// is a no-op.
+func (a *Applier) Restart(ctx context.Context, app *application.Application, namespace string) error {
+	selector := AppLabelSelector(app.Name)
+	if _, err := a.Client.DeletePodsBySelector(ctx, namespace, selector); err != nil {
+		return fmt.Errorf("%w: restart: %v", deployment.ErrDeployFailed, err)
+	}
+	return nil
+}
+
 func (a *Applier) waitReady(origCtx context.Context, deploymentID int64, namespace, depName string, replicas int) error {
 	pollCtx, cancel := context.WithTimeout(context.Background(), a.ReadyTimeout)
 	defer cancel()
