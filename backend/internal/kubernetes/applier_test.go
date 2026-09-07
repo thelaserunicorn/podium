@@ -185,6 +185,61 @@ func (f *fakeImageLoader) lastCluster() string {
 	return f.calls[len(f.calls)-1]
 }
 
+// TestApplier_LoadBeforeApply ensures the applier pushes the image
+// into the kind cluster BEFORE writing the Deployment spec. If the
+// load step ran second, a kind-load failure would leave a live
+// Deployment pointing at an image that's not in any cluster node —
+// pods stuck at ImagePullBackOff until the user manually re-applies.
+// Ordering the load first means a load failure aborts before the
+// cluster is touched.
+func TestApplier_LoadBeforeApply(t *testing.T) {
+	ctx := context.Background()
+	a, _, depID := newApplierFixture(t, 1)
+	a.Client.ClusterName = "podium"
+
+	// Wrap the fake clientset's Create reactor with a probe: when the
+	// Deployment is created, snapshot how many times the loader has
+	// been called. It must be ≥ 1 (load happened first).
+	loader := &fakeImageLoader{}
+	a.Loader = loader
+
+	var createSeen bool
+	var loaderCallsAtCreate int
+	cs := a.Client.CS.(*fake.Clientset)
+	cs.PrependReactor("create", "deployments", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		if !createSeen {
+			createSeen = true
+			loader.mu.Lock()
+			loaderCallsAtCreate = len(loader.calls)
+			loader.mu.Unlock()
+		}
+		return false, nil, nil
+	})
+
+	// Drive ReadyReplicas up so the poll loop exits promptly.
+	cs.PrependReactor("get", "deployments", func(action k8stesting.Action) (bool, runtime.Object, error) {
+		getAction, ok := action.(k8stesting.GetActionImpl)
+		if !ok {
+			return false, nil, nil
+		}
+		dep, err := cs.Tracker().Get(getAction.GetResource(), getAction.GetNamespace(), getAction.GetName())
+		if err != nil {
+			return false, nil, err
+		}
+		d := dep.(*appsv1.Deployment)
+		d.Status.ReadyReplicas = int32(*d.Spec.Replicas)
+		d.Status.Replicas = int32(*d.Spec.Replicas)
+		return true, d, nil
+	})
+
+	if err := a.Apply(ctx, depID); err != nil {
+		t.Fatalf("Apply: %v", err)
+	}
+	if loaderCallsAtCreate < 1 {
+		t.Errorf("LoadIntoKind called %d times before ApplyDeployment; want >= 1 (load must run first)", loaderCallsAtCreate)
+	}
+}
+
 // TestApplier_PassesClusterNameToLoader: the kind-load step must
 // receive the cluster name derived from kubeconfig so the image lands
 // in the right cluster when the host runs more than one. Without

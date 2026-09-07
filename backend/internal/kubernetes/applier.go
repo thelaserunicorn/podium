@@ -122,17 +122,25 @@ func (a *Applier) Apply(ctx context.Context, deploymentID int64) error {
 		return err
 	}
 
+	// Push the built image into the kind cluster BEFORE writing the
+	// Deployment spec. If `kind load` fails (image missing locally,
+	// kind binary on PATH missing, cluster unreachable) we want a
+	// clean abort — never a live Deployment whose pods will sit at
+	// ImagePullBackOff forever. ApplyDeployment runs second so the
+	// only state we leave behind on failure is the (idempotent) kind
+	// load step.
+	if a.Loader != nil {
+		if err := a.Loader.LoadIntoKind(ctx, d.Image, a.Client.ClusterName); err != nil {
+			return fmt.Errorf("%w: kind load: %v", deployment.ErrDeployFailed, err)
+		}
+	}
+
 	depName, err := a.Client.ApplyDeployment(ctx, &app, env.Namespace, d.Image, d.Replicas, envFrom)
 	if err != nil {
 		return fmt.Errorf("%w: %v", deployment.ErrDeployFailed, err)
 	}
 	if err := a.Client.ApplyService(ctx, &app, env.Namespace); err != nil {
 		return fmt.Errorf("%w: %v", deployment.ErrDeployFailed, err)
-	}
-	if a.Loader != nil {
-		if err := a.Loader.LoadIntoKind(ctx, d.Image, a.Client.ClusterName); err != nil {
-			return fmt.Errorf("%w: kind load: %v", deployment.ErrDeployFailed, err)
-		}
 	}
 
 	if err := a.Store.SetDeploymentStatus(ctx, deploymentID, storage.StatusStarting, ""); err != nil {
