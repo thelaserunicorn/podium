@@ -1,22 +1,32 @@
 # docker-compose.yml — one-shot Podium demo.
 #
+# Two services:
+#
+#   - `podium`  (Go API + orchestrator, image built from ./Dockerfile)
+#   - `frontend` (nginx serving the React bundle, image built from
+#     ./frontend/Dockerfile, proxies /api/* to podium:8080)
+#
 # DECISIONS.md A pins the demo path as: Podium on the host, kind cluster
 # on the host, Podium talks to the host's docker daemon and the host's
-# kubeconfig. This compose file mirrors that path inside a single
-# container so docker compose up is enough to bring the whole demo up.
+# kubeconfig. This compose file mirrors that path inside two containers
+# so `docker compose up` is enough to bring the whole demo up.
 #
-# Three mounts are required (see docs/ubuntu-setup.md for the same story
-# from a host-binary perspective):
+# The `podium` service uses host networking (see the service block
+# comment) so the bind-mounted kubeconfig's
+# `server: https://127.0.0.1:<kind-port>` URLs resolve correctly.
+# The `frontend` service uses the default bridge network and reaches
+# `podium:8080` via the compose DNS resolver — host network mode is
+# not needed there because nginx only talks to the API, not the host's
+# docker daemon.
+#
+# Three mounts are required on `podium` (see docs/ubuntu-setup.md for
+# the same story from a host-binary perspective):
 #
 #   - /data → SQLite database + cloned sources (persistent)
 #   - ~/.kube/config → kind cluster credentials (read-only)
 #   - /var/run/docker.sock → host Docker daemon (so Podium can `docker
 #     build` into the host's image cache and `kind load docker-image`
 #     into the kind node)
-#
-# Plus `network_mode: host` so the bind-mounted kubeconfig's
-# `server: https://127.0.0.1:<kind-port>` URLs resolve correctly.
-# See the service block comment for the trade-off.
 #
 # The runtime image is debian:bookworm-slim with git installed (the
 # orchestrator shells out to `git clone` for every deploy).
@@ -58,6 +68,28 @@ services:
       # /var/run/docker.sock works without extra_hosts; on Linux it works
       # directly. Reviewers using OrbStack or colima may need to remap.
       - /var/run/docker.sock:/var/run/docker.sock
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    image: podium-frontend:dev
+    container_name: podium-frontend
+    restart: unless-stopped
+    # The frontend talks to the Go backend over the compose network's
+    # built-in DNS resolver: nginx.conf references `podium:8080` and
+    # docker-compose creates that hostname automatically. We do NOT
+    # use network_mode: host here — the frontend only needs to reach
+    # the backend, not the host's docker daemon, so the bridge network
+    # is fine and gives us clean isolation.
+    # No environment block — nginx is a pure static server + reverse
+    # proxy; all configuration lives in nginx.conf.
+    depends_on:
+      - podium
+    ports:
+      # Same port the Vite dev server used (5173) so users on a fresh
+      # laptop don't need to learn a new URL.
+      - "5173:80"
 
 volumes:
   podium-data:

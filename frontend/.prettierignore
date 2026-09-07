@@ -2,3 +2,9 @@ node_modules
 dist
 dist-ssr
 *.local
+
+# Build artifacts (Dockerfile, nginx.conf, .dockerignore). Prettier
+# has no parser for these — they're not source files.
+Dockerfile
+*.conf
+.dockerignore

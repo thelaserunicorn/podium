@@ -1,0 +1,16 @@
+# Files excluded from the Docker build context for the frontend image.
+# Mirrors backend/.dockerignore in spirit: keep the build context small
+# so the COPY in frontend/Dockerfile doesn't drag along hundreds of MB
+# of source / state.
+#
+# nginx.conf and Dockerfile are intentionally NOT excluded — both are
+# referenced by the Dockerfile's COPY instructions.
+node_modules
+dist
+.git
+.gitignore
+.dockerignore
+.DS_Store
+*.log
+coverage
+.nyc_output
