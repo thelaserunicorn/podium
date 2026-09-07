@@ -7,10 +7,11 @@ import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { K8sOverview } from "@/components/K8sOverview";
+import { K8sOverview, type K8sState } from "@/components/K8sOverview";
 import { EnvVarsPanel } from "@/components/EnvVarsPanel";
 import { AppLogsTab } from "@/components/AppLogsTab";
 import { AppEventsTab } from "@/components/AppEventsTab";
+import { AppUrlCard } from "@/components/AppUrlCard";
 
 interface Application {
   id: number;
@@ -188,28 +189,31 @@ export function AppDetailPage() {
       </div>
 
       {tab === "overview" && (
-        <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
-          <Card>
-            <CardHeader>
-              <CardTitle>Overview</CardTitle>
-            </CardHeader>
-            <CardContent className="space-y-3 text-sm">
-              <Row label="Container port" value={String(app.container_port)} />
-              <Row label="Created" value={new Date(app.created_at).toLocaleString()} />
-              <Row label="Updated" value={new Date(app.updated_at).toLocaleString()} />
-              <div className="border-t border-border pt-3">
-                <K8sOverview appId={app.id} namespace={namespace} />
-              </div>
-            </CardContent>
-          </Card>
-          <Card className="md:col-span-2">
-            <CardHeader>
-              <CardTitle>Recent activity</CardTitle>
-            </CardHeader>
-            <CardContent className="text-sm text-muted-foreground">
-              Switch to the Deployments tab to see history and start a new deploy.
-            </CardContent>
-          </Card>
+        <div className="space-y-4">
+          <AppUrlCardWithState appId={app.id} namespace={namespace} />
+          <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
+            <Card>
+              <CardHeader>
+                <CardTitle>Overview</CardTitle>
+              </CardHeader>
+              <CardContent className="space-y-3 text-sm">
+                <Row label="Container port" value={String(app.container_port)} />
+                <Row label="Created" value={new Date(app.created_at).toLocaleString()} />
+                <Row label="Updated" value={new Date(app.updated_at).toLocaleString()} />
+                <div className="border-t border-border pt-3">
+                  <K8sOverview appId={app.id} namespace={namespace} />
+                </div>
+              </CardContent>
+            </Card>
+            <Card className="md:col-span-2">
+              <CardHeader>
+                <CardTitle>Recent activity</CardTitle>
+              </CardHeader>
+              <CardContent className="text-sm text-muted-foreground">
+                Switch to the Deployments tab to see history and start a new deploy.
+              </CardContent>
+            </Card>
+          </div>
         </div>
       )}
 
@@ -624,4 +628,39 @@ function statusVariant(
     default:
       return "secondary";
   }
+}
+
+// AppUrlCardWithState polls /state once to learn whether the
+// (app, namespace) pair has a live Deployment in the cluster. If it
+// does, the Service exists and the reverse-proxy URL is reachable —
+// render the URL card. Otherwise show the empty state ("deploy at
+// least once"). This is a small wrapper around AppUrlCard; the URL
+// card itself stays purely presentational.
+function AppUrlCardWithState({ appId, namespace }: { appId: number; namespace: string }) {
+  const [hasDeployment, setHasDeployment] = useState(false);
+
+  useEffect(() => {
+    let cancelled = false;
+    setHasDeployment(false);
+    void (async () => {
+      try {
+        const res = await api.get<K8sState>(
+          `/api/applications/${appId}/state?namespace=${encodeURIComponent(namespace)}`,
+        );
+        if (cancelled) return;
+        // `deployment_name` is set whenever the Deployment object
+        // exists in the cluster; that's the same condition Podium
+        // uses to decide whether to create the Service (the URL
+        // card's pre-condition).
+        setHasDeployment(!!res?.available && !!res?.deployment_name);
+      } catch {
+        if (!cancelled) setHasDeployment(false);
+      }
+    })();
+    return () => {
+      cancelled = true;
+    };
+  }, [appId, namespace]);
+
+  return <AppUrlCard appID={appId} namespace={namespace} hasDeployment={hasDeployment} />;
 }
