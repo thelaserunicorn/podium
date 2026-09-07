@@ -1,8 +1,12 @@
 package application
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"log/slog"
+	"strings"
 	"sync"
 	"testing"
 
@@ -164,5 +168,136 @@ func TestDelete_NoCleanerIsPureSQLite(t *testing.T) {
 	}
 	if err := svc.Delete(ctx, app.ID, userID); err != nil {
 		t.Fatalf("Delete: %v", err)
+	}
+}
+
+// captureLogs swaps slog.Default() with one writing to a buffer for the
+// duration of fn, then restores the previous default. Used to assert
+// that a particular Warn line was emitted without polluting the test
+// output with the rest of the package's log traffic.
+func captureLogs(t *testing.T, fn func()) string {
+	t.Helper()
+	prev := slog.Default()
+	t.Cleanup(func() { slog.SetDefault(prev) })
+
+	var buf bytes.Buffer
+	slog.SetDefault(slog.New(slog.NewJSONHandler(&buf, &slog.HandlerOptions{
+		Level: slog.LevelDebug,
+	})))
+	fn()
+	return buf.String()
+}
+
+// findWarn returns the first JSON log record whose msg field matches
+// `want` and whose level is "WARN", or nil if there isn't one.
+func findWarn(t *testing.T, logs, want string) map[string]any {
+	t.Helper()
+	for _, line := range strings.Split(strings.TrimSpace(logs), "\n") {
+		if line == "" {
+			continue
+		}
+		var rec map[string]any
+		if err := json.Unmarshal([]byte(line), &rec); err != nil {
+			continue
+		}
+		if rec["level"] == "WARN" && rec["msg"] == want {
+			return rec
+		}
+	}
+	return nil
+}
+
+func TestDelete_NoCleanerWithDeploymentsLogsWarning(t *testing.T) {
+	// Regression test for the "deleting from UI doesn't delete from
+	// k8s" bug. When Podium boots before the kind cluster is reachable
+	// (so WithResourceCleaner was never called) but the app being
+	// deleted has prior deployments / env vars, the SQLite row is
+	// removed but the cluster resources are silently orphaned. The fix
+	// is a Warn-level log naming the namespaces so an operator knows
+	// to either restart Podium after kind is up or manually clean up.
+	//
+	// cleanupSvc wires the cleaner, so this test rebuilds the fixture
+	// without it — same shape, no WithResourceCleaner.
+	db := storage.OpenInMemoryForTest(t)
+	q := storage.NewQueries(db)
+	svc := NewService(db).WithQueries(q) // cleaner intentionally nil
+	ctx := context.Background()
+
+	userID := seedUser(t, q)
+	app, err := svc.Create(ctx, CreateInput{
+		Name:          "demo",
+		RepositoryURL: "https://github.com/x/y",
+		ContainerPort: 8080,
+		UserID:        userID,
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+	devEnv, err := q.GetEnvironmentByNamespace(ctx, "podium-dev")
+	if err != nil {
+		t.Fatalf("podium-dev env: %v", err)
+	}
+	stagingEnv, err := q.GetEnvironmentByNamespace(ctx, "podium-staging")
+	if err != nil {
+		t.Fatalf("podium-staging env: %v", err)
+	}
+	if _, err := q.UpsertEnvVar(ctx, app.ID, devEnv.ID, "FOO", "bar", false); err != nil {
+		t.Fatalf("upsert env var: %v", err)
+	}
+	if _, err := q.CreateDeployment(ctx, app.ID, stagingEnv.ID, 1, 1, "demo:v1"); err != nil {
+		t.Fatalf("create deployment: %v", err)
+	}
+
+	logs := captureLogs(t, func() {
+		if err := svc.Delete(ctx, app.ID, userID); err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+	})
+
+	rec := findWarn(t, logs, "app delete skipped k8s cleanup: cleaner not wired")
+	if rec == nil {
+		t.Fatalf("expected Warn log line; got:\n%s", logs)
+	}
+	if rec["app_id"] == nil {
+		t.Errorf("Warn missing app_id field: %+v", rec)
+	}
+	if rec["app_name"] != "demo" {
+		t.Errorf("Warn app_name=%v want demo", rec["app_name"])
+	}
+	ns, ok := rec["namespaces"].([]any)
+	if !ok || len(ns) == 0 {
+		t.Errorf("Warn namespaces=%v want non-empty list", rec["namespaces"])
+	}
+}
+
+func TestDelete_NoCleanerWithoutDeploymentsStaysSilent(t *testing.T) {
+	// Negative control: when the app has no prior deployments / env
+	// vars, no cleaner being wired is fine — there's nothing to clean
+	// up. Delete should succeed with no Warn line so the log doesn't
+	// become noise on every fresh-app delete.
+	db := storage.OpenInMemoryForTest(t)
+	q := storage.NewQueries(db)
+	svc := NewService(db).WithQueries(q) // cleaner intentionally nil
+	ctx := context.Background()
+
+	userID := seedUser(t, q)
+	app, err := svc.Create(ctx, CreateInput{
+		Name:          "fresh",
+		RepositoryURL: "https://github.com/x/y",
+		ContainerPort: 8080,
+		UserID:        userID,
+	})
+	if err != nil {
+		t.Fatalf("create: %v", err)
+	}
+
+	logs := captureLogs(t, func() {
+		if err := svc.Delete(ctx, app.ID, userID); err != nil {
+			t.Fatalf("Delete: %v", err)
+		}
+	})
+
+	if findWarn(t, logs, "app delete skipped k8s cleanup: cleaner not wired") != nil {
+		t.Errorf("unexpected Warn for fresh app with no prior deployments:\n%s", logs)
 	}
 }

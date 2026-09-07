@@ -292,9 +292,22 @@ func (s *Service) Delete(ctx context.Context, id, userID int64) error {
 
 	// Snapshot the namespaces the app touched BEFORE the DELETE —
 	// FK ON DELETE CASCADE will reap the deployments / env_vars rows
-	// that EnvironmentsForApp joins against.
+	// that EnvironmentsForApp joins against. We need this list in two
+	// situations:
+	//
+	//  1. The cleaner is wired — we call it once per namespace below.
+	//  2. The cleaner is NOT wired (e.g. Podium booted before the kind
+	//     cluster was reachable, so main.go never called
+	//     WithResourceCleaner) but the app had prior deployments.
+	//     Without the warning in case 2 the user deletes an app from
+	//     the dashboard and the Deployment / Service / ConfigMap /
+	//     Secret are silently orphaned in the cluster. The only signal
+	//     something went wrong is a future `kubectl get all` showing
+	//     resources for a non-existent app. We log loudly so the
+	//     operator knows to either restart Podium after kind is up, or
+	//     manually clean up the orphans.
 	var envs []storage.Environment
-	if s.cleaner != nil && s.queries != nil {
+	if s.queries != nil {
 		envs, err = s.queries.EnvironmentsForApp(ctx, app.ID)
 		if err != nil {
 			// Don't fail the delete for a metadata read miss. The
@@ -319,7 +332,18 @@ func (s *Service) Delete(ctx context.Context, id, userID int64) error {
 		return ErrNotFound
 	}
 
-	if s.cleaner == nil || len(envs) == 0 {
+	if s.cleaner == nil {
+		if len(envs) > 0 {
+			// App had prior deployments / env vars but no cleaner is
+			// wired — surface the orphan-risk loudly so an operator
+			// can either restart Podium after the cluster is up or
+			// manually run `kubectl delete` for the namespaces below.
+			slog.Default().Warn("app delete skipped k8s cleanup: cleaner not wired",
+				"app_id", app.ID,
+				"app_name", app.Name,
+				"namespaces", namespaceNames(envs),
+				"hint", "Podium booted before the cluster was reachable; restart after `kind create cluster`")
+		}
 		return nil
 	}
 	for i := range envs {
@@ -332,6 +356,16 @@ func (s *Service) Delete(ctx context.Context, id, userID int64) error {
 		}
 	}
 	return nil
+}
+
+// namespaceNames projects the environment rows down to just their
+// Kubernetes namespace strings for log output.
+func namespaceNames(envs []storage.Environment) []string {
+	out := make([]string, len(envs))
+	for i, e := range envs {
+		out[i] = e.Namespace
+	}
+	return out
 }
 
 // rowScanner lets Get / List share scanApplication.
