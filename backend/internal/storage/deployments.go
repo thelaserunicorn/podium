@@ -535,3 +535,90 @@ func (q *Queries) ApplicationNextVersion(ctx context.Context, appID int64) (int,
 	}
 	return v, nil
 }
+
+// LatestSuccessfulDeployment returns the most recent RUNNING deployment
+// for (appID, envID) excluding the deployment with id `excludeID`. Used
+// by Rollback to discover the image we want to redeploy when the user
+// hasn't named a specific version. Returns sql.ErrNoRows when no
+// successful deployment exists in that namespace yet.
+func (q *Queries) LatestSuccessfulDeployment(ctx context.Context, appID, envID, excludeID int64) (*Deployment, error) {
+	if q == nil || q.db == nil {
+		return nil, errors.New("storage: queries not initialised")
+	}
+	row := q.db.QueryRowContext(ctx, `
+		SELECT id, application_id, environment_id, version, image, replicas,
+		       status, reason, created_at, started_at, finished_at
+		FROM deployments
+		WHERE application_id = ? AND environment_id = ?
+		  AND status = 'RUNNING'
+		  AND id <> ?
+		ORDER BY version DESC, id DESC
+		LIMIT 1
+	`, appID, envID, excludeID)
+	d := &Deployment{}
+	var status string
+	var createdAt string
+	var startedAt, finishedAt sql.NullString
+	var reason sql.NullString
+	if err := row.Scan(&d.ID, &d.ApplicationID, &d.EnvironmentID, &d.Version, &d.Image,
+		&d.Replicas, &status, &reason, &createdAt, &startedAt, &finishedAt); err != nil {
+		return nil, err
+	}
+	d.Status = DeploymentStatus(status)
+	d.Reason = reason
+	if t, err := parseTS(createdAt); err == nil {
+		d.CreatedAt = t
+	}
+	if startedAt.Valid {
+		if t, err := parseTS(startedAt.String); err == nil {
+			d.StartedAt = sql.NullTime{Time: t, Valid: true}
+		}
+	}
+	if finishedAt.Valid {
+		if t, err := parseTS(finishedAt.String); err == nil {
+			d.FinishedAt = sql.NullTime{Time: t, Valid: true}
+		}
+	}
+	return d, nil
+}
+
+// DeploymentAtVersion returns the deployment for (appID, envID, version)
+// or sql.ErrNoRows if no such row exists. Used by Rollback to look up
+// the exact target image when the user picks a specific prior version.
+func (q *Queries) DeploymentAtVersion(ctx context.Context, appID, envID int64, version int) (*Deployment, error) {
+	if q == nil || q.db == nil {
+		return nil, errors.New("storage: queries not initialised")
+	}
+	row := q.db.QueryRowContext(ctx, `
+		SELECT id, application_id, environment_id, version, image, replicas,
+		       status, reason, created_at, started_at, finished_at
+		FROM deployments
+		WHERE application_id = ? AND environment_id = ? AND version = ?
+		LIMIT 1
+	`, appID, envID, version)
+	d := &Deployment{}
+	var status string
+	var createdAt string
+	var startedAt, finishedAt sql.NullString
+	var reason sql.NullString
+	if err := row.Scan(&d.ID, &d.ApplicationID, &d.EnvironmentID, &d.Version, &d.Image,
+		&d.Replicas, &status, &reason, &createdAt, &startedAt, &finishedAt); err != nil {
+		return nil, err
+	}
+	d.Status = DeploymentStatus(status)
+	d.Reason = reason
+	if t, err := parseTS(createdAt); err == nil {
+		d.CreatedAt = t
+	}
+	if startedAt.Valid {
+		if t, err := parseTS(startedAt.String); err == nil {
+			d.StartedAt = sql.NullTime{Time: t, Valid: true}
+		}
+	}
+	if finishedAt.Valid {
+		if t, err := parseTS(finishedAt.String); err == nil {
+			d.FinishedAt = sql.NullTime{Time: t, Valid: true}
+		}
+	}
+	return d, nil
+}

@@ -353,6 +353,71 @@ func TestLatestDeploymentStatuses_OmitsNeverDeployed(t *testing.T) {
 	}
 }
 
+func TestLatestSuccessfulDeployment_PicksNewestExcludingSelf(t *testing.T) {
+	q := newTestQueries(t)
+	_, appID, envID := seedUserAppEnv(t, q)
+	ctx := context.Background()
+
+	// Three RUNNING deployments + one FAILED. LatestSuccessfulDeployment
+	// must return the newest RUNNING row that is not excluded.
+	id1, _ := q.CreateDeployment(ctx, appID, envID, 1, 1, "a:v1")
+	q.SetDeploymentStatus(ctx, id1, StatusRunning, "")
+	id2, _ := q.CreateDeployment(ctx, appID, envID, 2, 1, "a:v2")
+	q.SetDeploymentStatus(ctx, id2, StatusRunning, "")
+	id3, _ := q.CreateDeployment(ctx, appID, envID, 3, 1, "a:v3")
+	q.SetDeploymentStatus(ctx, id3, StatusRunning, "")
+	id4, _ := q.CreateDeployment(ctx, appID, envID, 4, 1, "a:v4")
+	q.SetDeploymentStatus(ctx, id4, StatusFailed, "boom")
+
+	// Excluding id3 (the newest RUNNING) must yield id2.
+	got, err := q.LatestSuccessfulDeployment(ctx, appID, envID, id3)
+	if err != nil {
+		t.Fatalf("LatestSuccessfulDeployment: %v", err)
+	}
+	if got.ID != id2 || got.Version != 2 || got.Image != "a:v2" {
+		t.Errorf("got=%+v want id=%d v2 a:v2", got, id2)
+	}
+}
+
+func TestLatestSuccessfulDeployment_NoSuccessfulReturnsErrNoRows(t *testing.T) {
+	q := newTestQueries(t)
+	_, appID, envID := seedUserAppEnv(t, q)
+	ctx := context.Background()
+
+	id, _ := q.CreateDeployment(ctx, appID, envID, 1, 1, "a:v1")
+	q.SetDeploymentStatus(ctx, id, StatusFailed, "boom")
+	// Mid-deploy BUILDING doesn't count either.
+	id2, _ := q.CreateDeployment(ctx, appID, envID, 2, 1, "a:v2")
+	q.SetDeploymentStatus(ctx, id2, StatusBuilding, "")
+
+	_, err := q.LatestSuccessfulDeployment(ctx, appID, envID, id)
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Errorf("err=%v want sql.ErrNoRows", err)
+	}
+}
+
+func TestDeploymentAtVersion_FoundAndMissing(t *testing.T) {
+	q := newTestQueries(t)
+	_, appID, envID := seedUserAppEnv(t, q)
+	ctx := context.Background()
+
+	id, _ := q.CreateDeployment(ctx, appID, envID, 3, 1, "a:v3")
+	q.SetDeploymentStatus(ctx, id, StatusRunning, "")
+
+	got, err := q.DeploymentAtVersion(ctx, appID, envID, 3)
+	if err != nil {
+		t.Fatalf("DeploymentAtVersion: %v", err)
+	}
+	if got.ID != id || got.Image != "a:v3" {
+		t.Errorf("got=%+v want id=%d a:v3", got, id)
+	}
+
+	_, err = q.DeploymentAtVersion(ctx, appID, envID, 999)
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Errorf("missing version: err=%v want sql.ErrNoRows", err)
+	}
+}
+
 func TestLatestDeploymentStatuses_CrossNamespace(t *testing.T) {
 	q := newTestQueries(t)
 	_, appID, envID := seedUserAppEnv(t, q)
