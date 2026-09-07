@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
+import { Button } from "@/components/ui/button";
 
 // PodSummary mirrors backend/internal/kubernetes.PodSummary.
 export interface PodSummary {
@@ -40,12 +41,20 @@ interface K8sOverviewProps {
 //   - a graceful "cluster not configured" message when state.available
 //     is false (e.g. KUBECONFIG missing)
 //
-// The polling pattern mirrors BuildLogViewer: recursive setTimeout with
-// a cancel handle, so navigation away from the page tears the loop down.
+// M4 adds the Scale / Restart controls inline. They live here (rather
+// than on the Deployments tab) because they operate on the running
+// Deployment the Overview already polls — the user sees the new
+// replica count without context-switching.
 export function K8sOverview({ appId, namespace }: K8sOverviewProps) {
   const [state, setState] = useState<K8sState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const cancelRef = useRef<(() => void) | null>(null);
+  // `desired` is the slider value; we initialise it lazily once the
+  // first state poll returns so the slider matches reality on first
+  // render. `busy` disables the controls while a request is in flight.
+  const [desired, setDesired] = useState<number | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   const tick = useCallback(async () => {
     try {
@@ -54,6 +63,10 @@ export function K8sOverview({ appId, namespace }: K8sOverviewProps) {
       );
       setState(res);
       setError(null);
+      // Sync the slider to the live desired count the first time we
+      // see a real (non-zero) value, so the user doesn't see "0"
+      // flickering before the first poll lands.
+      setDesired((prev) => (prev == null && res.available ? res.desired_replicas : prev));
     } catch (e) {
       setError((e as Error).message);
     }
@@ -78,6 +91,44 @@ export function K8sOverview({ appId, namespace }: K8sOverviewProps) {
     return () => cancelRef.current?.();
   }, [tick]);
 
+  // Reset the slider when the namespace changes so we don't apply
+  // the previous-ns replica count to a different namespace.
+  useEffect(() => {
+    setDesired(null);
+    setActionError(null);
+  }, [namespace]);
+
+  const scale = async () => {
+    if (desired == null) return;
+    setBusy(true);
+    setActionError(null);
+    try {
+      await api.post(`/api/applications/${appId}/scale`, {
+        namespace,
+        replicas: desired,
+      });
+      await tick();
+    } catch (e) {
+      setActionError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const restart = async () => {
+    if (!window.confirm("Restart the application? Pods will be deleted and recreated.")) return;
+    setBusy(true);
+    setActionError(null);
+    try {
+      await api.post(`/api/applications/${appId}/restart`, { namespace });
+      await tick();
+    } catch (e) {
+      setActionError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  };
+
   if (error && !state) {
     return <p className="text-xs text-destructive">{error}</p>;
   }
@@ -91,6 +142,11 @@ export function K8sOverview({ appId, namespace }: K8sOverviewProps) {
       </p>
     );
   }
+
+  // The slider tracks `desired` (user input) once known, otherwise
+  // mirrors the live state so the UI doesn't flash a stale value.
+  const sliderValue = desired ?? state.desired_replicas;
+  const sliderDirty = desired != null && desired !== state.desired_replicas;
 
   return (
     <div className="space-y-3 text-sm">
@@ -109,6 +165,36 @@ export function K8sOverview({ appId, namespace }: K8sOverviewProps) {
             {state.current_replicas} / {state.desired_replicas}
           </span>
         </div>
+      </div>
+
+      <div className="flex flex-wrap items-center gap-3 border-t border-border pt-3">
+        <label className="flex items-center gap-2 text-xs">
+          <span className="text-muted-foreground">Scale to:</span>
+          <input
+            type="range"
+            min={1}
+            max={5}
+            step={1}
+            value={sliderValue}
+            disabled={busy}
+            onChange={(e) => setDesired(Number(e.target.value))}
+            className="h-2 w-32 cursor-pointer accent-primary"
+            aria-label="Replicas"
+          />
+          <span className="w-4 font-mono">{sliderValue}</span>
+        </label>
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={busy || !sliderDirty}
+          onClick={() => void scale()}
+        >
+          {busy ? "Scaling…" : "Scale"}
+        </Button>
+        <Button size="sm" variant="outline" disabled={busy} onClick={() => void restart()}>
+          {busy ? "Restarting…" : "Restart"}
+        </Button>
+        {actionError && <span className="text-xs text-destructive">{actionError}</span>}
       </div>
 
       {state.pods.length === 0 ? (
