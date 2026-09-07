@@ -2,7 +2,6 @@ package kubernetes
 
 import (
 	"context"
-	"encoding/base64"
 	"fmt"
 
 	corev1 "k8s.io/api/core/v1"
@@ -66,22 +65,25 @@ func (c *Client) ApplyConfigMap(ctx context.Context, appName string, appID int64
 }
 
 // ApplySecret creates or updates the Secret holding secret env vars
-// for an application in the given namespace. Per DECISIONS.md E the
-// values are base64-encoded inside the Secret object — there's no
-// separate encryption at rest in SQLite beyond the K8s Secret
-// boundary (which the kind cluster stores as plain files in etcd).
+// for an application in the given namespace. The values go straight
+// into Secret.Data: the Kubernetes API server base64-encodes the
+// bytes on the wire and stores them that way in etcd; the kubelet
+// reverses that transparently so pods see the plaintext as their
+// env var. (DECISIONS.md E's "base64-encoded inside the Secret
+// object" refers to that on-the-wire encoding — not a second
+// application-level encoding.)
 //
-// `data` keys map to values that will be exposed as envFrom entries
-// on the Deployment; values are base64-std encoded here so the
-// Kubernetes API server doesn't reject them.
+// There is no separate encryption at rest in SQLite beyond the K8s
+// Secret boundary (kind's etcd writes the values as plain files,
+// which is acceptable for the MVP's local-k8s demo).
 func (c *Client) ApplySecret(ctx context.Context, appName string, appID int64, namespace string, data map[string]string) error {
 	if len(data) == 0 {
 		return nil
 	}
 	name := EnvSecretName(appName, appID)
-	encoded := make(map[string][]byte, len(data))
+	binary := make(map[string][]byte, len(data))
 	for k, v := range data {
-		encoded[k] = []byte(base64.StdEncoding.EncodeToString([]byte(v)))
+		binary[k] = []byte(v)
 	}
 	sec := &corev1.Secret{
 		ObjectMeta: metav1.ObjectMeta{
@@ -94,7 +96,7 @@ func (c *Client) ApplySecret(ctx context.Context, appName string, appID int64, n
 			},
 		},
 		Type: corev1.SecretTypeOpaque,
-		Data: encoded,
+		Data: binary,
 	}
 	secrets := c.CS.CoreV1().Secrets(namespace)
 	_, err := secrets.Create(ctx, sec, metav1.CreateOptions{})

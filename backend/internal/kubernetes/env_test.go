@@ -2,9 +2,9 @@ package kubernetes
 
 import (
 	"context"
-	"encoding/base64"
 	"testing"
 
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 )
 
@@ -46,7 +46,11 @@ func TestApplyConfigMap_EmptyMapIsNoOp(t *testing.T) {
 	}
 }
 
-func TestApplySecret_Base64EncodesValues(t *testing.T) {
+func TestApplySecret_StoresValuesVerbatim(t *testing.T) {
+	// Per DECISIONS.md E, secret env-var values go into a Kubernetes
+	// Secret. The apiserver handles on-the-wire base64 encoding of
+	// Secret.Data; Podium does NOT additionally encode. The pod
+	// receives the plaintext as the env var via envFrom.
 	ctx := context.Background()
 	c := newTestClient(t)
 
@@ -58,12 +62,12 @@ func TestApplySecret_Base64EncodesValues(t *testing.T) {
 	if err != nil {
 		t.Fatalf("get secret: %v", err)
 	}
-	decoded, err := base64.StdEncoding.DecodeString(string(sec.Data["DB_PASSWORD"]))
-	if err != nil {
-		t.Fatalf("decode base64: %v", err)
+	if string(sec.Data["DB_PASSWORD"]) != "hunter2" {
+		t.Errorf("Secret.Data[DB_PASSWORD]=%q want hunter2 (no double-encoding)",
+			string(sec.Data["DB_PASSWORD"]))
 	}
-	if string(decoded) != "hunter2" {
-		t.Errorf("decoded=%q want hunter2", string(decoded))
+	if sec.Type != corev1.SecretTypeOpaque {
+		t.Errorf("Secret.Type=%v want Opaque", sec.Type)
 	}
 }
 
