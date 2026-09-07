@@ -29,12 +29,27 @@ const AppLabel = "app"
 // ApplyDeployment creates or updates the Deployment for an application
 // in the given namespace, with the given image + replica count. Returns
 // the chosen Deployment name (which is also the Service name).
-func (c *Client) ApplyDeployment(ctx context.Context, app *application.Application, namespace, image string, replicas int) (string, error) {
+//
+// envFrom configures envFrom entries on the container — typically the
+// per-app ConfigMap (non-secret vars) and Secret (secret vars) defined
+// by ApplyConfigMap / ApplySecret. Pass nil to omit envFrom entirely.
+func (c *Client) ApplyDeployment(ctx context.Context, app *application.Application, namespace, image string, replicas int, envFrom []corev1.EnvFromSource) (string, error) {
 	if replicas < 1 {
 		replicas = 1
 	}
 	name := DeploymentName(app.Name, app.ID)
 	replicas32 := int32(replicas)
+	container := corev1.Container{
+		Name:  app.Name,
+		Image: image,
+		Ports: []corev1.ContainerPort{{
+			ContainerPort: int32(app.ContainerPort),
+			Protocol:      corev1.ProtocolTCP,
+		}},
+	}
+	if len(envFrom) > 0 {
+		container.EnvFrom = envFrom
+	}
 	dep := &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      name,
@@ -50,14 +65,7 @@ func (c *Client) ApplyDeployment(ctx context.Context, app *application.Applicati
 			Template: corev1.PodTemplateSpec{
 				ObjectMeta: metav1.ObjectMeta{Labels: map[string]string{AppLabel: app.Name}},
 				Spec: corev1.PodSpec{
-					Containers: []corev1.Container{{
-						Name:  app.Name,
-						Image: image,
-						Ports: []corev1.ContainerPort{{
-							ContainerPort: int32(app.ContainerPort),
-							Protocol:      corev1.ProtocolTCP,
-						}},
-					}},
+					Containers: []corev1.Container{container},
 				},
 			},
 		},
@@ -74,6 +82,13 @@ func (c *Client) ApplyDeployment(ctx context.Context, app *application.Applicati
 		return name, fmt.Errorf("kubernetes: create deployment %s/%s: %w", namespace, name, err)
 	}
 	return name, nil
+}
+
+// ApplyDeploymentNoEnv is the no-envFrom convenience wrapper. It
+// exists so callers that don't need env vars (tests, the M2/M3
+// code path before env vars landed) don't have to pass nil.
+func (c *Client) ApplyDeploymentNoEnv(ctx context.Context, app *application.Application, namespace, image string, replicas int) (string, error) {
+	return c.ApplyDeployment(ctx, app, namespace, image, replicas, nil)
 }
 
 // CurrentReplicas reads readyReplicas / desired replicas from the

@@ -15,7 +15,7 @@ func TestScaleDeployment_UpdatesReplicaCount(t *testing.T) {
 	ctx := context.Background()
 	c := newTestClient(t)
 	app := &application.Application{ID: 1, Name: "demo", ContainerPort: 8080}
-	name, err := c.ApplyDeployment(ctx, app, "podium-dev", "demo:v1", 2)
+	name, err := c.ApplyDeploymentNoEnv(ctx, app, "podium-dev", "demo:v1", 2)
 	if err != nil {
 		t.Fatalf("ApplyDeployment: %v", err)
 	}

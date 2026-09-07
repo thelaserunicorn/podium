@@ -51,7 +51,7 @@ func TestApplyDeployment_CreatesAndUpdates(t *testing.T) {
 	c := newTestClient(t)
 	app := &application.Application{ID: 1, Name: "my-api", ContainerPort: 8080}
 
-	name, err := c.ApplyDeployment(ctx, app, "podium-dev", "my-api:v1", 3)
+	name, err := c.ApplyDeploymentNoEnv(ctx, app, "podium-dev", "my-api:v1", 3)
 	if err != nil {
 		t.Fatalf("ApplyDeployment: %v", err)
 	}
@@ -76,7 +76,7 @@ func TestApplyDeployment_CreatesAndUpdates(t *testing.T) {
 	}
 
 	// Second call must take the update branch and not error.
-	if _, err := c.ApplyDeployment(ctx, app, "podium-dev", "my-api:v2", 5); err != nil {
+	if _, err := c.ApplyDeploymentNoEnv(ctx, app, "podium-dev", "my-api:v2", 5); err != nil {
 		t.Fatalf("ApplyDeployment update: %v", err)
 	}
 	updated, _ := c.CS.AppsV1().Deployments("podium-dev").Get(ctx, name, metav1.GetOptions{})
@@ -92,7 +92,7 @@ func TestCurrentReplicas(t *testing.T) {
 	ctx := context.Background()
 	c := newTestClient(t)
 	app := &application.Application{ID: 7, Name: "demo", ContainerPort: 8080}
-	name, _ := c.ApplyDeployment(ctx, app, "podium-dev", "demo:v1", 2)
+	name, _ := c.ApplyDeploymentNoEnv(ctx, app, "podium-dev", "demo:v1", 2)
 
 	// Before the fake has noticed any ReadyReplicas, current should be 0.
 	cur, des, err := c.CurrentReplicas(ctx, "podium-dev", name)
