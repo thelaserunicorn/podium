@@ -7,11 +7,12 @@
 #                  modernc.org/sqlite (pure-Go SQLite, no CGo). The
 #                  version tracks the `go` directive in backend/go.mod.
 #
-# Stage 2 (runtime): distroless/static:nonroot — ~15MB image, runs as
-#                    UID 65532. The /data volume is where Podium keeps
-#                    its SQLite database and cloned source trees; mount
-#                    a host directory or named volume there (see
-#                    docker-compose.yml).
+# Stage 2 (runtime): distroless/static-debian12 (no shell, no busybox).
+#                    We pre-create /data by COPYing a placeholder file
+#                    (see below). The /data path may also be a bind-
+#                    mounted volume; in that case the bind mount
+#                    shadows this directory and the placeholder is
+#                    hidden.
 #
 # Build context must be the Podium repo root; only `backend/` is copied
 # into the build stage. See .dockerignore for the full exclusion list.
@@ -31,10 +32,18 @@ RUN CGO_ENABLED=0 GOOS=linux go build \
         -o /out/podium \
         ./cmd/podium
 
-FROM gcr.io/distroless/static-debian12:nonroot
+FROM gcr.io/distroless/static-debian12
 WORKDIR /app
 
 COPY --from=build /out/podium /app/podium
+
+# Pre-create the data directory by COPYing a placeholder file. `COPY`
+# with a source directory creates the destination if it doesn't exist
+# (Dockerfile semantics); the placeholder file is harmless because
+# distroless has no shell to trip on it. The /data path may also be a
+# bind-mounted volume; in that case the bind mount shadows this
+# directory and the placeholder is hidden.
+COPY docker-data-placeholder /data/.placeholder
 
 # Defaults; docker-compose.yml / docs/ubuntu-setup.md override where needed.
 ENV PODIUM_ADDR=:8080 \
@@ -44,8 +53,4 @@ ENV PODIUM_ADDR=:8080 \
 EXPOSE 8080
 VOLUME ["/data"]
 
-# distroless/static has no shell, so the user is already nonroot. ENTRYPOINT
-# must be exec-form (the JSON array below) because there is no shell to parse
-# a string command.
-USER nonroot:nonroot
 ENTRYPOINT ["/app/podium"]

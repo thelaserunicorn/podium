@@ -1,0 +1,6 @@
+Podium writes its SQLite database and cloned source trees under /data.
+This file exists so the Docker COPY instruction creates /data at image
+build time — distroless has no shell, so mkdir is not available inside
+the runtime image. When /data is bind-mounted (docker-compose or
+`docker run -v ...`) the bind mount shadows this directory and this
+file is not visible to the container.
