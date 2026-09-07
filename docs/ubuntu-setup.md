@@ -122,13 +122,20 @@ SQLite lives on the `podium-data` named volume at `/data/podium.db`.
 2. In a private window, log in as `admin` → Admin dashboard → Approve `alice`.
 3. Log in as `alice` → Applications → New application:
    - name: `hello`
-   - repository_url: any public GitHub repo with a Dockerfile
-   - container_port: the port the app listens on inside the container (commonly `8080`)
+   - repository_url: `https://github.com/thelaserunicorn/podium-hello`
+   - container_port: `80`
 4. Click **Deploy**, pick a namespace (e.g. `podium-dev`), confirm.
 5. Watch the deployment row transition `QUEUED → BUILDING → BUILT → DEPLOYING → STARTING → RUNNING`.
 6. On the Overview tab, click **Open** on the App URL card. A new tab opens
    at `http://127.0.0.1:40000` (or whichever 40000–40099 port was assigned)
-   served by a `kubectl port-forward` straight into the running Pod.
+   served by a `kubectl port-forward` straight into the running Pod. The
+   page shows the pod hostname; refresh a few times after scaling to >1
+   replica to see the hostname rotate.
+
+The `podium-hello` demo app is intentionally tiny — static HTML/CSS/JS
+served by `nginx:alpine`, with a `/hostname` endpoint that prints the
+container hostname (i.e. the Pod name). Source lives at
+<https://github.com/thelaserunicorn/podium-hello>.
 
 If the URL shows "Could not reach the app", the deployment row probably
 isn't RUNNING yet — wait for it. The card polls on mount and only fetches
