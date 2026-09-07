@@ -1,0 +1,64 @@
+# docker-compose.yml — one-shot Podium demo.
+#
+# DECISIONS.md A pins the demo path as: Podium on the host, kind cluster
+# on the host, Podium talks to the host's docker daemon and the host's
+# kubeconfig. This compose file mirrors that path inside a single
+# container so docker compose up is enough to bring the whole demo up.
+#
+# Three mounts are required (see docs/ubuntu-setup.md for the same story
+# from a host-binary perspective):
+#
+#   - /data → SQLite database + cloned sources (persistent)
+#   - ~/.kube/config → kind cluster credentials (read-only)
+#   - /var/run/docker.sock → host Docker daemon (so Podium can `docker
+#     build` into the host's image cache and `kind load docker-image`
+#     into the kind node)
+#
+# The distroless runtime has no shell, so the entrypoint is exec-form
+# straight through to the binary.
+
+services:
+  podium:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: podium:dev
+    container_name: podium
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      PODIUM_ADDR: ":8080"
+      PODIUM_ADMIN_USERNAME: ${PODIUM_ADMIN_USERNAME:-admin}
+      # Default password is a placeholder; override in production. The
+      # README's "Local setup" section calls this out explicitly.
+      PODIUM_ADMIN_PASSWORD: ${PODIUM_ADMIN_PASSWORD:-change-me-now}
+      PODIUM_DB_PATH: /data/podium.db
+      PODIUM_SOURCE_ROOT: /data/sources
+      # The distroless user is UID 65532. Mount the kubeconfig so the
+      # path inside the container is predictable regardless of host UID.
+      KUBECONFIG: /home/nonroot/.kube/config
+    volumes:
+      - podium-data:/data
+      # Bind-mount the host's kubeconfig. ${HOME} on Linux is /home/<user>;
+      # on macOS Docker Desktop / OrbStack the same path resolves.
+      - ${HOME}/.kube/config:/home/nonroot/.kube/config:ro
+      # Docker socket — without this Podium can't build images or call
+      # `kind load docker-image`. On macOS Docker Desktop the default
+      # /var/run/docker.sock works without extra_hosts; on Linux it works
+      # directly. Reviewers using OrbStack or colima may need to remap.
+      - /var/run/docker.sock:/var/run/docker.sock
+    # The Dockerfile sets USER nonroot:nonroot (UID 65532) so the binary
+    # runs as an unprivileged process inside the distroless image. We do
+    # NOT pin `user:` here because the named `podium-data` volume is
+    # created by Docker as UID 0, and the nonroot user can't write into
+    # a root-owned volume mountpoint. The distroless image has no shell
+    # or setuid binaries, so running as root inside the container is
+    # meaningfully safer than in a typical Linux container — but the
+    # bind-mounted docker socket does expose the host root, so don't
+    # expose this compose file to the public internet.
+
+volumes:
+  podium-data:
+    # No `driver_opts` — the default local driver is fine for a single-
+    # node demo. For production swap in a real volume driver.
