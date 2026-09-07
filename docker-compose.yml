@@ -86,6 +86,14 @@ services:
     # proxy; all configuration lives in nginx.conf.
     depends_on:
       - podium
+    # Map `host.docker.internal` to the host gateway inside this
+    # container. This is what lets nginx reach the Go API listening
+    # on the host's loopback (because the `podium` service uses
+    # network_mode: host, the API isn't on the compose bridge network).
+    # On Docker Desktop / OrbStack this works out of the box; on Linux
+    # Docker we need the explicit mapping to the host gateway IP.
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
     ports:
       # Same port the Vite dev server used (5173) so users on a fresh
       # laptop don't need to learn a new URL.
