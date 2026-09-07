@@ -1,8 +1,11 @@
 package ingress
 
 import (
+	"bytes"
 	"context"
 	"errors"
+	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httputil"
@@ -137,6 +140,49 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		},
 		FlushInterval: -1,
 	}
+	// Wrap the writer so HTML responses get a <base> tag pointing at
+	// the proxied app path. Without this, `<link href="/static/...">`
+	// in the upstream's HTML resolves against the browser's page
+	// origin (e.g. Vite's :5173) instead of going through the proxy,
+	// so CSS/JS/images 404 or land on Vite's SPA fallback.
+	//
+	// Only modifies HTML responses (text/html; everything else passes
+	// through untouched). The injected base href is the proxied app's
+	// root, so:
+	//   /             -> /-/apps/{id}/{ns}/
+	//   /static/x.css -> /-/apps/{id}/{ns}/static/x.css
+	//   /new          -> /-/apps/{id}/{ns}/new
+	basePath := ingressBasePath(appID, namespace)
+	rp.ModifyResponse = func(resp *http.Response) error {
+		if !isHTML(resp.Header.Get("Content-Type")) {
+			return nil
+		}
+		// Buffer the body so we can inject the <base> tag before any
+		// bytes are flushed to the client. Bounded to 8 MiB to avoid
+		// pulling huge upstream responses into memory; larger payloads
+		// pass through unmodified.
+		const maxHTML = 8 * 1024 * 1024
+		body, err := io.ReadAll(io.LimitReader(resp.Body, maxHTML+1))
+		if err != nil {
+			return fmt.Errorf("ingress: read upstream body: %w", err)
+		}
+		_ = resp.Body.Close()
+		truncated := len(body) > maxHTML
+		if truncated {
+			body = body[:maxHTML]
+		}
+		body = injectBaseHref(body, basePath)
+		resp.Body = io.NopCloser(bytes.NewReader(body))
+		resp.ContentLength = int64(len(body))
+		// When we truncated, drop Content-Length matches and stream
+		// the remainder via an unrestrictive reader.
+		if truncated {
+			resp.ContentLength = -1
+			resp.Header.Set("X-Podium-Truncated", "1")
+		}
+		resp.Header.Set("Content-Length", strconv.Itoa(len(body)))
+		return nil
+	}
 	rp.ServeHTTP(w, r)
 }
 
@@ -165,4 +211,72 @@ func parseIngressPath(p string) (appID int64, namespace, rest string, err error)
 		return id, parts[1], "/", nil
 	}
 	return id, parts[1], "/" + parts[2], nil
+}
+
+// ingressBasePath returns the URL prefix the browser should use as the
+// document base for HTML responses proxied for (appID, ns). E.g.
+// ingressBasePath(11, "podium-dev") == "/-/apps/11/podium-dev/".
+func ingressBasePath(appID int64, ns string) string {
+	return "/-/apps/" + strconv.FormatInt(appID, 10) + "/" + ns + "/"
+}
+
+// isHTML returns true for the Content-Type values we want to rewrite
+// (i.e. HTML responses where a <base> tag fixes root-relative URLs).
+// Checks the prefix before any `; charset=...` parameter.
+func isHTML(ct string) bool {
+	if ct == "" {
+		return false
+	}
+	if i := strings.IndexByte(ct, ';'); i >= 0 {
+		ct = ct[:i]
+	}
+	return strings.EqualFold(strings.TrimSpace(ct), "text/html")
+}
+
+// injectBaseHref inserts (or replaces) a <base href="..."> tag inside
+// <head>. If <head> is not found, the tag is prepended to the body. If
+// the body is not valid UTF-8 (e.g. binary mistakenly tagged as HTML),
+// it is returned untouched.
+//
+// The injection is intentionally simple and string-based — we don't
+// pull in an HTML parser for a single tag. Edge cases:
+//   - <head> exists, no <base>     -> inject <base> as first child of <head>
+//   - <head> exists, <base> exists -> replace the existing <base ...> tag
+//   - <head> missing               -> prepend <base> (covers XML/SVG/fragmented HTML)
+func injectBaseHref(body []byte, basePath string) []byte {
+	if !bytes.Contains(body, []byte("<head")) {
+		// No <head>: prepend the base tag so the browser still
+		// resolves root-relative URLs against our proxied path.
+		// (Most HTML responses DO contain <head>, so this is a
+		// fallback for the rare SVG / fragment cases.)
+		tag := `<base href="` + basePath + `">`
+		return append([]byte(tag), body...)
+	}
+	tag := `<base href="` + basePath + `">`
+	if i := bytes.Index(body, []byte("<base")); i >= 0 {
+		// Replace the existing <base ...> tag in place. Find the end
+		// of the opening tag (`>`) and slice it out.
+		end := bytes.IndexByte(body[i:], '>')
+		if end < 0 {
+			return body // malformed; leave it alone
+		}
+		out := make([]byte, 0, len(body)+len(tag))
+		out = append(out, body[:i]...)
+		out = append(out, tag...)
+		out = append(out, body[i+end+1:]...)
+		return out
+	}
+	// No existing <base>: inject immediately after <head>.
+	headIdx := bytes.Index(body, []byte("<head"))
+	// Walk past the `<head` tag itself to find the next `>`.
+	gt := bytes.IndexByte(body[headIdx:], '>')
+	if gt < 0 {
+		return body
+	}
+	insertAt := headIdx + gt + 1
+	out := make([]byte, 0, len(body)+len(tag)+1)
+	out = append(out, body[:insertAt]...)
+	out = append(out, tag...)
+	out = append(out, body[insertAt:]...)
+	return out
 }
