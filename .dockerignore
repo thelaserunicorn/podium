@@ -1,0 +1,53 @@
+# Build context hygiene — keeps `docker build` from shipping hundreds of
+# MB of junk into the build daemon and keeps the Go module download
+# layer cacheable.
+
+# Local data — SQLite, cloned source trees, port-forward logs.
+data/
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+.tmp/
+
+# Frontend build artefacts + dependencies. Podium's runtime only ships
+# the compiled Go binary; the React app is built and served by the
+# dev server (Vite) or by your reverse proxy in production.
+frontend/node_modules/
+frontend/dist/
+frontend/.vite/
+frontend/tsconfig.tsbuildinfo
+
+# Backend build artefacts.
+backend/bin/
+backend/.tmp/
+bin/
+
+# Go test / coverage outputs.
+*.test
+*.out
+coverage.txt
+
+# Editor / OS.
+.git/
+.gitignore
+.gitattributes
+.DS_Store
+.vscode/
+.idea/
+
+# puku CLI artifacts and per-user prefs.
+.puku/
+PUKU.local.md
+skills-lock.json
+
+# Docs — not needed in the image; reviewers read them on GitHub.
+docs/
+README.md
+*.md
+LICENSE*
+
+# Docker artefacts themselves (don't recurse).
+Dockerfile
+.dockerignore
+docker-compose.yml
