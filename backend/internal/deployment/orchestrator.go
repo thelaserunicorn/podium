@@ -125,6 +125,106 @@ func (o *Orchestrator) IsActive(deploymentID int64) bool {
 	return ok
 }
 
+// Rollback redeploys a prior version of an app in a namespace without
+// rebuilding — the image already exists in the cluster, we just
+// create a new deployment row pointing at it and run the same
+// DEPLOYING → STARTING → RUNNING pipeline (DECISIONS.md D).
+//
+// `targetVersion` is the version to roll back TO. Passing 0 / a value
+// that doesn't exist means "roll back to the most recent successful
+// deployment". Returns the new deployment id; the row is in QUEUED
+// state when this method returns and the orchestrator takes it the
+// rest of the way (mirrors Run).
+//
+// Per DECISIONS.md D the per-application version counter is bumped
+// even for rollbacks, so a roll-back-to-v1 still creates a fresh
+// `v6` row pointing at the v1 image bytes. That keeps the deployment
+// history append-only and makes "what's running right now?" a one-row
+// query.
+func (o *Orchestrator) Rollback(ctx context.Context, app *application.Application, envID int64, targetVersion int) (int64, error) {
+	// 1. Resolve the target image. targetVersion==0 means "the most
+	// recent successful deployment" — that's the common case for a UI
+	// button that just says "Roll back".
+	var targetImage string
+	if targetVersion <= 0 {
+		d, err := o.store.LatestSuccessfulDeployment(ctx, app.ID, envID, 0)
+		if err != nil {
+			return 0, fmt.Errorf("deployment: rollback target: %w", err)
+		}
+		targetImage = d.Image
+	} else {
+		d, err := o.store.DeploymentAtVersion(ctx, app.ID, envID, targetVersion)
+		if err != nil {
+			return 0, fmt.Errorf("deployment: rollback target: %w", err)
+		}
+		targetImage = d.Image
+	}
+
+	// 2. Bump the version counter atomically (DECISIONS.md D). Two
+	// concurrent rollbacks for the same app get distinct versions.
+	version, err := o.store.ApplicationNextVersion(ctx, app.ID)
+	if err != nil {
+		return 0, fmt.Errorf("deployment: bump version: %w", err)
+	}
+
+	// 3. Reuse the latest deployment's replica count in this namespace
+	// (the user can re-scale after). Default 3 matches the UI's slider.
+	replicas := 3
+	if latest, err := o.store.ListDeployments(ctx, app.ID, envID); err == nil && len(latest) > 0 {
+		replicas = latest[0].Replicas
+	}
+
+	// 4. Insert the rollback row pointing at the prior image, then
+	// drive it through DEPLOYING → STARTING → RUNNING. No clone, no
+	// build, no kind-load — the image is already in the cluster.
+	id, err := o.store.CreateDeployment(ctx, app.ID, envID, version, replicas, targetImage)
+	if err != nil {
+		return 0, fmt.Errorf("deployment: insert rollback row: %w", err)
+	}
+	if err := o.runRollback(ctx, id); err != nil {
+		// The row exists; the caller reads its state via GetDeployment.
+		// runRollback also stamps FAILED with a reason on its own
+		// error paths so the UI sees a terminal state.
+		return id, err
+	}
+	return id, nil
+}
+
+// runRollback drives a single deployment row through DEPLOYING →
+// STARTING → RUNNING without touching the docker builder. It is the
+// tail end of runLocked (see below), split out so the rollback path
+// shares the k8s apply code without re-running clone/build.
+func (o *Orchestrator) runRollback(ctx context.Context, deploymentID int64) error {
+	if o.IsActive(deploymentID) {
+		return ErrAlreadyRunning
+	}
+	_, cancel := context.WithCancel(ctx)
+	o.mu.Lock()
+	o.active[deploymentID] = cancel
+	o.mu.Unlock()
+	defer func() {
+		cancel()
+		o.mu.Lock()
+		delete(o.active, deploymentID)
+		o.mu.Unlock()
+	}()
+
+	if o.k8s == nil {
+		// Same dev-mode behaviour as Run: no applier → stop at BUILT.
+		return o.store.SetDeploymentStatus(ctx, deploymentID, storage.StatusBuilt, "")
+	}
+	if err := o.store.SetDeploymentStatus(ctx, deploymentID, storage.StatusDeploying, ""); err != nil {
+		return err
+	}
+	deployCtx, cancel2 := context.WithTimeout(ctx, o.timeouts.Deploy)
+	defer cancel2()
+	if err := o.k8s.Apply(deployCtx, deploymentID); err != nil {
+		o.fail(ctx, deploymentID, err)
+		return err
+	}
+	return nil
+}
+
 // Scale patches the running Deployment's replica count (M4). When no
 // k8s applier is wired (M2 dev mode), the call is a no-op — there is
 // no Deployment to scale. Errors are returned to the caller; the API

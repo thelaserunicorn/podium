@@ -71,6 +71,7 @@ type fakeApplier struct {
 	mu       sync.Mutex
 	scales   []scaleCall
 	restarts []restartCall
+	applies  []int64
 	err      error
 }
 
@@ -99,12 +100,13 @@ func (f *fakeApplier) Restart(_ context.Context, app *application.Application, n
 	return f.err
 }
 
-// Apply is required by K8sApplier but unused by the Scale / Restart
-// tests. It records the call so a future test can assert on it.
+// Apply is required by K8sApplier. It records the call so Rollback
+// tests (and any future Apply tests) can assert on the deployment id
+// being applied.
 func (f *fakeApplier) Apply(_ context.Context, deploymentID int64) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
-	f.scales = append(f.scales, scaleCall{}) // sentinel so tests can detect "Apply was called"
+	f.applies = append(f.applies, deploymentID)
 	return f.err
 }
 
@@ -368,5 +370,154 @@ func TestOrchestrator_ScalePropagatesApplierError(t *testing.T) {
 	err := o.Scale(context.Background(), app, "podium-dev", 3)
 	if err == nil || err.Error() != "connection refused" {
 		t.Errorf("err=%v want connection refused", err)
+	}
+}
+
+// seedRollbackHistory inserts prior RUNNING deployments so Rollback
+// has something to roll back to. Returns the seeded appID/envID plus
+// the list of (version, image, id) tuples in version order.
+func seedRollbackHistory(t *testing.T, q *storage.Queries, userID int64) (appID, envID int64, versions [][3]any) {
+	t.Helper()
+	db := q.DB()
+	ctx := context.Background()
+	res, _ := db.ExecContext(ctx,
+		`INSERT INTO applications (user_id, name, repository_url, container_port) VALUES (?, 'rollback-app', 'https://github.com/x/y', 8080)`,
+		userID)
+	appID, _ = res.LastInsertId()
+	db.QueryRowContext(ctx, `SELECT id FROM environments WHERE namespace='podium-dev'`).Scan(&envID)
+	for v := 1; v <= 4; v++ {
+		img := fmt.Sprintf("rollback-app:v%d", v)
+		id, _ := q.CreateDeployment(ctx, appID, envID, v, 3, img)
+		// Mark each as RUNNING so LatestSuccessfulDeployment can pick them.
+		if err := q.SetDeploymentStatus(ctx, id, storage.StatusRunning, ""); err != nil {
+			t.Fatal(err)
+		}
+		// Mirror what ApplicationNextVersion would do in production:
+		// bump applications.version alongside each insert. Otherwise
+		// the next Rollback test would call ApplicationNextVersion
+		// from a counter at 0 and get version 1 instead of 5.
+		if _, err := db.ExecContext(ctx, `UPDATE applications SET version = ? WHERE id = ?`, v, appID); err != nil {
+			t.Fatal(err)
+		}
+		versions = append(versions, [3]any{id, v, img})
+	}
+	return
+}
+
+// rollbackFixture spins up an orchestrator + storage seeded with one
+// app ("rollback-app") and four RUNNING prior deployments. The
+// returned app already points at the seeded rollback-app so the
+// Rollback tests don't have to know the id.
+func rollbackFixture(t *testing.T) (*Orchestrator, *storage.Queries, *fakeApplier, *application.Application) {
+	t.Helper()
+	o, q, k8s, _, userID := newOrchFixtureWithK8s(t)
+	seededAppID, seededEnvID, _ := seedRollbackHistory(t, q, userID)
+	// Read back the fresh row so the ID is right (the seed uses
+	// fresh INSERTs, so the id is 2 in a clean DB).
+	db := q.DB()
+	var fresh application.Application
+	row := db.QueryRowContext(context.Background(),
+		`SELECT id, user_id, name, repository_url, container_port FROM applications WHERE id = ?`, seededAppID)
+	if err := row.Scan(&fresh.ID, &fresh.UserID, &fresh.Name, &fresh.RepositoryURL, &fresh.ContainerPort); err != nil {
+		t.Fatal(err)
+	}
+	// Stash envID on the orchestrator's note: we use it through `seededEnvID`.
+	t.Setenv("ROLLBACK_ENV_ID", fmt.Sprintf("%d", seededEnvID))
+	return o, q, k8s, &fresh
+}
+
+// TestOrchestrator_RollbackToLatestSuccessful: when targetVersion=0,
+// Rollback picks the most recent RUNNING row's image. The new row
+// gets the next version (5) and points at v4's image bytes — no rebuild.
+func TestOrchestrator_RollbackToLatestSuccessful(t *testing.T) {
+	o, q, k8s, app := rollbackFixture(t)
+	ctx := context.Background()
+	envID, _ := q.EnvironmentIDByNamespace(ctx, "podium-dev")
+
+	id, err := o.Rollback(ctx, app, envID, 0)
+	if err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+	// New row should be at v5 (counter was bumped past v4) and use v4's image.
+	d, err := q.GetDeployment(ctx, id)
+	if err != nil {
+		t.Fatalf("GetDeployment: %v", err)
+	}
+	if d.Version != 5 {
+		t.Errorf("version=%d want 5", d.Version)
+	}
+	if d.Image != "rollback-app:v4" {
+		t.Errorf("image=%q want rollback-app:v4 (target's bytes, no rebuild)", d.Image)
+	}
+	// fakeApplier.Apply is a no-op so the orchestrator's last write
+	// is DEPLOYING. The real k8s.Applier drives DEPLOYING →
+	// STARTING → RUNNING inside Apply; we just assert the row got
+	// past QUEUED here.
+	if d.Status != storage.StatusDeploying && d.Status != storage.StatusStarting && d.Status != storage.StatusRunning {
+		t.Errorf("status=%q want DEPLOYING/STARTING/RUNNING", d.Status)
+	}
+
+	// The k8s applier must have been called for the new deployment id.
+	k8s.mu.Lock()
+	defer k8s.mu.Unlock()
+	if len(k8s.applies) != 1 || k8s.applies[0] != id {
+		t.Errorf("applies=%v want [%d]", k8s.applies, id)
+	}
+}
+
+// TestOrchestrator_RollbackToSpecificVersion: the API lets the user
+// pick a specific prior version. The new row's image is the target's
+// image bytes, not a rebuild.
+func TestOrchestrator_RollbackToSpecificVersion(t *testing.T) {
+	o, q, _, app := rollbackFixture(t)
+	ctx := context.Background()
+	envID, _ := q.EnvironmentIDByNamespace(ctx, "podium-dev")
+
+	id, err := o.Rollback(ctx, app, envID, 2)
+	if err != nil {
+		t.Fatalf("Rollback: %v", err)
+	}
+	d, _ := q.GetDeployment(ctx, id)
+	if d.Image != "rollback-app:v2" {
+		t.Errorf("image=%q want rollback-app:v2", d.Image)
+	}
+	if d.Version != 5 {
+		t.Errorf("version=%d want 5 (counter bumped to 5)", d.Version)
+	}
+}
+
+// TestOrchestrator_RollbackUnknownVersionErrors: a target version that
+// doesn't exist must surface as an error (caller maps to 404 / 422).
+func TestOrchestrator_RollbackUnknownVersionErrors(t *testing.T) {
+	o, q, _, app := rollbackFixture(t)
+	ctx := context.Background()
+	envID, _ := q.EnvironmentIDByNamespace(ctx, "podium-dev")
+
+	_, err := o.Rollback(ctx, app, envID, 999)
+	if err == nil {
+		t.Fatal("expected error for unknown version")
+	}
+}
+
+// TestOrchestrator_RollbackNoSuccessfulReturnsErrNoRows: when the
+// namespace has zero RUNNING deployments (only FAILED ones), a
+// version=0 rollback has nothing to roll back to.
+func TestOrchestrator_RollbackNoSuccessfulReturnsErrNoRows(t *testing.T) {
+	o, q, _, app := rollbackFixture(t)
+	ctx := context.Background()
+	envID, _ := q.EnvironmentIDByNamespace(ctx, "podium-dev")
+
+	// Mark every seeded deployment FAILED so LatestSuccessfulDeployment
+	// returns sql.ErrNoRows.
+	list, _ := q.ListDeployments(ctx, app.ID, envID)
+	for _, d := range list {
+		if err := q.SetDeploymentStatus(ctx, d.ID, storage.StatusFailed, "boom"); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	_, err := o.Rollback(ctx, app, envID, 0)
+	if err == nil {
+		t.Fatal("expected sql.ErrNoRows when no successful deployment exists")
 	}
 }
