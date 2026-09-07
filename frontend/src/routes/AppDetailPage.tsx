@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useParams } from "react-router-dom";
-import { Play, RefreshCw } from "lucide-react";
+import { History, Play, RefreshCw } from "lucide-react";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -266,6 +266,33 @@ function DeploymentsTab({ appId, namespace }: { appId: number; namespace: string
     }
   }
 
+  async function rollback(d: Deployment) {
+    // Two-click confirmation inline keeps the action discoverable but
+    // protects against accidental clicks. window.confirm is overkill
+    // for an MVP rollback — the row state does that for us.
+    if (
+      !window.confirm(
+        `Roll back to v${d.version} (${d.image})? A new deployment will be created in ${namespace}.`,
+      )
+    ) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      const res = await api.post<{ deployment: Deployment }>(
+        `/api/deployments/${d.id}/rollback`,
+        {},
+      );
+      await load();
+      setSelected(res.deployment);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
   return (
     <div className="space-y-4">
       <div className="flex flex-col gap-3 sm:flex-row sm:items-center sm:justify-between">
@@ -327,6 +354,21 @@ function DeploymentsTab({ appId, namespace }: { appId: number; namespace: string
                     {new Date(d.created_at).toLocaleString()}
                   </span>
                   <Badge variant={statusVariant(d.status)}>{d.status}</Badge>
+                  {d.status === "RUNNING" && (
+                    <Button
+                      size="sm"
+                      variant="outline"
+                      disabled={busy}
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        void rollback(d);
+                      }}
+                      title="Roll back to this image"
+                    >
+                      <History className="h-4 w-4" />
+                      Roll back
+                    </Button>
+                  )}
                 </div>
               </li>
             ))}
