@@ -5,6 +5,7 @@ import (
 	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"strings"
 	"time"
 
@@ -47,8 +48,9 @@ type UpdateInput struct {
 // Service is the public entry point for the application package.
 type Service struct {
 	db        *sql.DB
-	queries   *storage.Queries // optional; populated by WithQueries for dashboard status lookups
-	testUsers *testUserIDs     // see WithUsers — nil in production
+	queries   *storage.Queries   // optional; populated by WithQueries for dashboard status lookups
+	cleaner   AppResourceCleaner // optional; populated by WithResourceCleaner for k8s cleanup on Delete and DeleteDeployment
+	testUsers *testUserIDs       // see WithUsers — nil in production
 }
 
 // testUserIDs holds two known user ids used only by application_test.go.
@@ -67,6 +69,17 @@ func NewService(db *sql.DB) *Service { return &Service{db: db} }
 func (s *Service) WithQueries(q *storage.Queries) *Service {
 	clone := *s
 	clone.queries = q
+	return &clone
+}
+
+// WithResourceCleaner returns a copy of the Service that will invoke
+// the cleaner to drop Kubernetes resources (Deployment / Service /
+// ConfigMap / Secret) for every namespace the deleted app touched.
+// Optional — when nil (older callers, unit tests without a cluster),
+// Delete remains a pure SQLite operation.
+func (s *Service) WithResourceCleaner(c AppResourceCleaner) *Service {
+	clone := *s
+	clone.cleaner = c
 	return &clone
 }
 
@@ -255,7 +268,42 @@ func (s *Service) Update(ctx context.Context, id int64, in UpdateInput) (Applica
 
 // Delete removes the application and (via FK ON DELETE CASCADE) any related
 // deployments / env vars. Returns ErrNotFound if id is unknown or not owned.
+//
+// When the service was constructed with a resource cleaner, Delete
+// also drops the Kubernetes Deployment / Service / ConfigMap / Secret
+// for every namespace the app touched. The cleaner is invoked AFTER
+// the SQLite row is gone so a k8s failure does not leave the user
+// looking at an app that still exists in the dashboard; the worst
+// case is orphaned cluster resources, which the user can address by
+// re-creating the app later (a re-create will not collide because
+// the resource name is derived from the new app id).
+//
+// The list of namespaces to clean up is captured BEFORE the SQLite
+// DELETE because the FK ON DELETE CASCADE removes the deployment +
+// env_var rows whose join produces that list.
 func (s *Service) Delete(ctx context.Context, id, userID int64) error {
+	// Load first so we have the app (with Name + ID) to pass to the
+	// cleaner, AND so we can short-circuit with ErrNotFound for the
+	// "wrong owner" case before touching anything.
+	app, err := s.Get(ctx, id, userID)
+	if err != nil {
+		return err
+	}
+
+	// Snapshot the namespaces the app touched BEFORE the DELETE —
+	// FK ON DELETE CASCADE will reap the deployments / env_vars rows
+	// that EnvironmentsForApp joins against.
+	var envs []storage.Environment
+	if s.cleaner != nil && s.queries != nil {
+		envs, err = s.queries.EnvironmentsForApp(ctx, app.ID)
+		if err != nil {
+			// Don't fail the delete for a metadata read miss. The
+			// SQLite row will still be removed; the cleaner simply
+			// won't be invoked.
+			envs = nil
+		}
+	}
+
 	res, err := s.db.ExecContext(ctx, `
 		DELETE FROM applications WHERE id = ? AND user_id = ?
 	`, id, userID)
@@ -267,7 +315,21 @@ func (s *Service) Delete(ctx context.Context, id, userID int64) error {
 		return fmt.Errorf("application: rows affected: %w", err)
 	}
 	if n == 0 {
+		// Race: someone else just deleted it. Treat as not-found.
 		return ErrNotFound
+	}
+
+	if s.cleaner == nil || len(envs) == 0 {
+		return nil
+	}
+	for i := range envs {
+		if cerr := s.cleaner.DeleteAppResources(ctx, &app, envs[i].Namespace); cerr != nil {
+			// Best-effort: log via the default logger and continue.
+			// The SQLite row is already gone; orphaned cluster
+			// resources are recoverable, a stuck delete isn't.
+			slog.Default().Warn("clean k8s resources after app delete",
+				"app_id", app.ID, "namespace", envs[i].Namespace, "err", cerr)
+		}
 	}
 	return nil
 }
