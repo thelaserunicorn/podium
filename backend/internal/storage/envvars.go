@@ -76,6 +76,12 @@ func (q *Queries) ListEnvVars(ctx context.Context, appID, envID int64) ([]EnvVar
 // (application_id, environment_id, key). The unique constraint
 // guarantees one row per (app, env, key). Returns the row id so
 // callers can construct response shapes.
+//
+// We don't use res.LastInsertId() because its behaviour after
+// `ON CONFLICT ... DO UPDATE` is driver-defined and not always the
+// existing row's id (it can return a freshly-allocated id from the
+// AUTOINCREMENT sequence). The post-upsert SELECT by unique key is
+// the portable way to discover the row id.
 func (q *Queries) UpsertEnvVar(ctx context.Context, appID, envID int64, key, value string, isSecret bool) (int64, error) {
 	if q == nil || q.db == nil {
 		return 0, errors.New("storage: queries not initialised")
@@ -84,7 +90,7 @@ func (q *Queries) UpsertEnvVar(ctx context.Context, appID, envID int64, key, val
 	if isSecret {
 		secret = 1
 	}
-	res, err := q.db.ExecContext(ctx, `
+	if _, err := q.db.ExecContext(ctx, `
 		INSERT INTO environment_variables
 			(application_id, environment_id, key, value, is_secret, created_at, updated_at)
 		VALUES (?, ?, ?, ?, ?, strftime('%Y-%m-%dT%H:%M:%fZ', 'now'), strftime('%Y-%m-%dT%H:%M:%fZ', 'now'))
@@ -92,13 +98,15 @@ func (q *Queries) UpsertEnvVar(ctx context.Context, appID, envID int64, key, val
 			value      = excluded.value,
 			is_secret  = excluded.is_secret,
 			updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-	`, appID, envID, key, value, secret)
-	if err != nil {
+	`, appID, envID, key, value, secret); err != nil {
 		return 0, fmt.Errorf("storage: upsert env var: %w", err)
 	}
-	id, err := res.LastInsertId()
-	if err != nil {
-		return 0, fmt.Errorf("storage: last insert id: %w", err)
+	var id int64
+	if err := q.db.QueryRowContext(ctx, `
+		SELECT id FROM environment_variables
+		 WHERE application_id = ? AND environment_id = ? AND key = ?
+	`, appID, envID, key).Scan(&id); err != nil {
+		return 0, fmt.Errorf("storage: re-read upserted env var: %w", err)
 	}
 	return id, nil
 }

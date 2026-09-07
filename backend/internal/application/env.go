@@ -126,7 +126,7 @@ func (s *EnvService) Set(ctx context.Context, app *Application, envID int64, nam
 		}
 	}
 	for _, v := range vars {
-		if v.ID == id {
+		if v.Key == in.Key {
 			return v.Redacted(), nil
 		}
 	}
