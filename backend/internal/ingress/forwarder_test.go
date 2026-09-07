@@ -30,6 +30,11 @@ type fakeRunner struct {
 	// Otherwise the fake just emits the readiness line and returns
 	// the channel — DialContext would fail because nothing is listening.
 	readyListener bool
+	// dieWithStderr, when non-empty, makes the fake emit this text on
+	// stderr and then close both pipes immediately (simulating
+	// kubectl exiting because the Service is in the wrong namespace
+	// or doesn't exist yet).
+	dieWithStderr string
 
 	mu      sync.Mutex
 	cancels []context.CancelFunc
@@ -73,6 +78,26 @@ func (f *fakeRunner) Start(_ context.Context, name string, args ...string) (io.R
 	// race Start against it). Closing the pipe signals subprocess exit.
 	stderrR, stderrW := io.Pipe()
 	stdoutR, stdoutW := io.Pipe()
+
+	// dieWithStderr simulates a kubectl process that exits before
+	// becoming ready — e.g. wrong namespace, missing Service. The
+	// forwarder's error path should surface the stderr tail.
+	if f.dieWithStderr != "" {
+		go func() {
+			_, _ = io.WriteString(stderrW, f.dieWithStderr)
+			_ = stderrW.Close()
+			_ = stdoutW.Close()
+			close(exited)
+		}()
+		cancel := func() {
+			_ = stderrW.Close()
+			_ = stdoutW.Close()
+		}
+		f.mu.Lock()
+		f.cancels = append(f.cancels, cancel)
+		f.mu.Unlock()
+		return stdoutR, stderrR, cancel, exited, nil
+	}
 
 	cancel := func() {
 		if ln != nil {
@@ -330,4 +355,30 @@ func TestForwarder_StopBeforeStartIsNoOp(t *testing.T) {
 	if err := f.Stop(); err != nil {
 		t.Errorf("Stop before Start: %v", err)
 	}
+}
+
+func TestForwarder_StartSurfacesStderrTail(t *testing.T) {
+	// kubectl exits before printing the readiness line because the
+	// Service isn't there. The forwarder should surface the stderr
+	// tail in the error so the user can see *why* it died (rather
+	// than a generic "did not become ready"). This is the exact
+	// shape of the "app_unavailable" bug from M6 — without -n, kubectl
+	// reports NotFound and the user has no clue.
+	fake := &fakeRunner{
+		readyDelay:    0,
+		dieWithStderr: "Error from server (NotFound): services \"missing\" not found\n",
+	}
+	f := NewForwarder("podium-dev", "missing", freePort(t), 8080, nil)
+	f.SetRunner(fake)
+	f.SetReadyTimeout(2 * time.Second)
+
+	err := f.Start(context.Background())
+	if err == nil {
+		t.Fatal("Start should fail when kubectl dies before readiness")
+	}
+	if !strings.Contains(err.Error(), "NotFound") || !strings.Contains(err.Error(), "missing") {
+		t.Errorf("err=%v want it to surface kubectl's stderr tail", err)
+	}
+	// Cleanup so the fake goroutine doesn't outlive the test.
+	fake.KillAll()
 }

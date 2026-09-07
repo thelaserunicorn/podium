@@ -126,6 +126,7 @@ func (f *Forwarder) Start(ctx context.Context) error {
 
 	args := []string{
 		"port-forward",
+		"-n", f.ns,
 		"svc/" + f.svc,
 		fmt.Sprintf("%d:%d", f.localPort, f.remotePort),
 	}
@@ -173,16 +174,28 @@ func (f *Forwarder) Start(ctx context.Context) error {
 	f.lastErr = nil
 	f.mu.Unlock()
 
+	// Capture every line kubectl writes to stderr so we can surface
+	// the real reason when it dies before becoming ready. Without
+	// this the user only sees "exited before becoming ready" with no
+	// clue that the Service is in the wrong namespace or doesn't
+	// exist. We still log each line at debug in the watch goroutine
+	// (so the operator sees the same picture); the buffer is for the
+	// error path only.
+	stderrBuf := &lineBuffer{max: 16}
 	// The watch goroutine parses stderr for the "Forwarding from"
 	// marker and closes `ready` once seen. It also drains stdout so
 	// the subprocess never blocks on a full pipe.
 	ready := make(chan struct{})
-	go f.watch(stdout, stderr, ready)
+	go f.watch(stdout, stderr, stderrBuf, ready)
 
 	select {
 	case <-ready:
 		return nil
 	case <-doneCh:
+		tail := strings.TrimSpace(stderrBuf.String())
+		if tail != "" {
+			return fmt.Errorf("ingress: kubectl port-forward exited before becoming ready: %s", tail)
+		}
 		return errors.New("ingress: kubectl port-forward exited before becoming ready")
 	case <-ctx.Done():
 		cancel()
@@ -244,7 +257,12 @@ func (f *Forwarder) Stop() error {
 // to avoid back-pressuring the subprocess. The goroutine returns when
 // stderr is closed (the subprocess exited and the OS closed its end
 // of the pipe).
-func (f *Forwarder) watch(stdout, stderr io.ReadCloser, ready chan struct{}) {
+//
+// stderrBuf, when non-nil, receives every line for error reporting.
+// The buffer is only consulted on the failure path; on the success
+// path (forwarder reached readiness) we don't surface kubectl's
+// chatter to the user.
+func (f *Forwarder) watch(stdout, stderr io.ReadCloser, stderrBuf *lineBuffer, ready chan struct{}) {
 	// Line-buffer kubectl's stderr; emit each line at debug.
 	go func() {
 		s := bufio.NewScanner(stderr)
@@ -252,6 +270,9 @@ func (f *Forwarder) watch(stdout, stderr io.ReadCloser, ready chan struct{}) {
 		for s.Scan() {
 			line := s.Text()
 			f.log.Debug("kubectl port-forward", "ns", f.ns, "svc", f.svc, "line", line)
+			if stderrBuf != nil {
+				stderrBuf.append(line)
+			}
 			if strings.Contains(line, fmt.Sprintf("Forwarding from 127.0.0.1:%d", f.localPort)) {
 				select {
 				case <-ready:
@@ -268,6 +289,31 @@ func (f *Forwarder) watch(stdout, stderr io.ReadCloser, ready chan struct{}) {
 	if stdout != nil {
 		go io.Copy(io.Discard, stdout)
 	}
+}
+
+// lineBuffer is a small bounded ring of recent lines, used to surface
+// kubectl's last words in the error path. Not safe for concurrent use;
+// only one goroutine (the watch loop) writes.
+type lineBuffer struct {
+	mu  sync.Mutex
+	buf []string
+	max int
+}
+
+func (b *lineBuffer) append(line string) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.buf = append(b.buf, line)
+	if len(b.buf) > b.max {
+		// Drop the oldest entries.
+		b.buf = b.buf[len(b.buf)-b.max:]
+	}
+}
+
+func (b *lineBuffer) String() string {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return strings.Join(b.buf, " | ")
 }
 
 func isClosed(ch <-chan struct{}) bool {
