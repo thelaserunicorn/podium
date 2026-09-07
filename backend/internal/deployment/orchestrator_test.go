@@ -8,6 +8,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/podium/podium/internal/application"
 	"github.com/podium/podium/internal/docker"
 	"github.com/podium/podium/internal/storage"
 )
@@ -59,6 +60,51 @@ func (f *fakeFetcher) Fetch(_ context.Context, repoURL, destDir string) error {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.calls = append(f.calls, fetchCall{url: repoURL, dest: destDir})
+	return f.err
+}
+
+// fakeApplier implements K8sApplier for the Scale / Restart unit
+// tests. It records the call args so tests can assert on the
+// (namespace, replicas) / (namespace, app) plumbing without depending
+// on a real cluster.
+type fakeApplier struct {
+	mu       sync.Mutex
+	scales   []scaleCall
+	restarts []restartCall
+	err      error
+}
+
+type scaleCall struct {
+	app      *application.Application
+	ns       string
+	replicas int
+}
+
+type restartCall struct {
+	app *application.Application
+	ns  string
+}
+
+func (f *fakeApplier) Scale(_ context.Context, app *application.Application, ns string, replicas int) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.scales = append(f.scales, scaleCall{app: app, ns: ns, replicas: replicas})
+	return f.err
+}
+
+func (f *fakeApplier) Restart(_ context.Context, app *application.Application, ns string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.restarts = append(f.restarts, restartCall{app: app, ns: ns})
+	return f.err
+}
+
+// Apply is required by K8sApplier but unused by the Scale / Restart
+// tests. It records the call so a future test can assert on it.
+func (f *fakeApplier) Apply(_ context.Context, deploymentID int64) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.scales = append(f.scales, scaleCall{}) // sentinel so tests can detect "Apply was called"
 	return f.err
 }
 
@@ -222,5 +268,105 @@ func TestStorageSink_AppendsEachLine(t *testing.T) {
 	lines, _ := q.LogLinesSince(ctx, depID, time.Time{})
 	if len(lines) != 3 {
 		t.Errorf("expected 3 lines, got %d", len(lines))
+	}
+}
+
+// newOrchFixtureWithK8s is the M4 variant: it wires a fakeApplier
+// (replacing the nil k8s used by newOrchFixture) so Scale / Restart
+// have something to delegate to.
+func newOrchFixtureWithK8s(t *testing.T) (*Orchestrator, *storage.Queries, *fakeApplier, *application.Application, int64) {
+	t.Helper()
+	db := storage.OpenInMemoryForTest(t)
+	q := storage.NewQueries(db)
+	ctx := context.Background()
+
+	res, _ := db.ExecContext(ctx,
+		`INSERT INTO users (username, email, password_hash, role, status) VALUES (?, ?, ?, 'USER', 'APPROVED')`,
+		"alice", "alice@example.com", "x")
+	userID, _ := res.LastInsertId()
+	res, _ = db.ExecContext(ctx,
+		`INSERT INTO applications (user_id, name, repository_url, container_port) VALUES (?, ?, ?, ?)`,
+		userID, "my-api", "https://github.com/x/y", 8080)
+	appID, _ := res.LastInsertId()
+
+	k8s := &fakeApplier{}
+	appSvc := application.NewService(db)
+	app, _ := appSvc.GetByID(ctx, appID)
+
+	o := NewOrchestrator(q, &fakeBuilder{}, &fakeFetcher{}, t.TempDir(), Timeouts{Build: 5 * time.Second}, k8s)
+	return o, q, k8s, &app, userID
+}
+
+// TestOrchestrator_ScaleForwardsToK8sApplier: the orchestrator must
+// thread the (app, namespace, replicas) tuple through to the k8s
+// applier verbatim. The API handler has already validated ownership
+// and the replicas range — the orchestrator is a thin shim.
+func TestOrchestrator_ScaleForwardsToK8sApplier(t *testing.T) {
+	o, _, k8s, app, _ := newOrchFixtureWithK8s(t)
+	ctx := context.Background()
+
+	if err := o.Scale(ctx, app, "podium-dev", 5); err != nil {
+		t.Fatalf("Scale: %v", err)
+	}
+	k8s.mu.Lock()
+	defer k8s.mu.Unlock()
+	if len(k8s.scales) != 1 {
+		t.Fatalf("scales=%d want 1", len(k8s.scales))
+	}
+	got := k8s.scales[0]
+	if got.ns != "podium-dev" {
+		t.Errorf("ns=%q want podium-dev", got.ns)
+	}
+	if got.replicas != 5 {
+		t.Errorf("replicas=%d want 5", got.replicas)
+	}
+	if got.app == nil || got.app.ID != app.ID {
+		t.Errorf("app mismatch: %+v", got.app)
+	}
+}
+
+// TestOrchestrator_RestartForwardsToK8sApplier: same shape as Scale.
+func TestOrchestrator_RestartForwardsToK8sApplier(t *testing.T) {
+	o, _, k8s, app, _ := newOrchFixtureWithK8s(t)
+	ctx := context.Background()
+
+	if err := o.Restart(ctx, app, "podium-staging"); err != nil {
+		t.Fatalf("Restart: %v", err)
+	}
+	k8s.mu.Lock()
+	defer k8s.mu.Unlock()
+	if len(k8s.restarts) != 1 {
+		t.Fatalf("restarts=%d want 1", len(k8s.restarts))
+	}
+	if got := k8s.restarts[0]; got.ns != "podium-staging" || got.app == nil || got.app.ID != app.ID {
+		t.Errorf("restart args mismatch: %+v", got)
+	}
+}
+
+// TestOrchestrator_ScaleWithoutK8sReturnsError: when Podium is booted
+// without a kubeconfig (dev / CI), Scale and Restart must fail loud
+// rather than silently no-op. The API handler turns this into 502.
+func TestOrchestrator_ScaleWithoutK8sReturnsError(t *testing.T) {
+	o, _, _, _, _ := newOrchFixture(t)
+	ctx := context.Background()
+	app := application.Application{ID: 1, Name: "demo", ContainerPort: 8080}
+	if err := o.Scale(ctx, &app, "podium-dev", 2); err == nil {
+		t.Error("expected error when k8s applier is nil")
+	}
+	if err := o.Restart(ctx, &app, "podium-dev"); err == nil {
+		t.Error("expected error when k8s applier is nil")
+	}
+}
+
+// TestOrchestrator_ScalePropagatesApplierError: if the k8s applier
+// returns an error, the orchestrator surfaces it unchanged so the
+// API handler can convert it into a 502 response with the underlying
+// message.
+func TestOrchestrator_ScalePropagatesApplierError(t *testing.T) {
+	o, _, k8s, app, _ := newOrchFixtureWithK8s(t)
+	k8s.err = errors.New("connection refused")
+	err := o.Scale(context.Background(), app, "podium-dev", 3)
+	if err == nil || err.Error() != "connection refused" {
+		t.Errorf("err=%v want connection refused", err)
 	}
 }

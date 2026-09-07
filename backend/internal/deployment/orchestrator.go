@@ -18,6 +18,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/podium/podium/internal/application"
 	"github.com/podium/podium/internal/docker"
 	"github.com/podium/podium/internal/storage"
 )
@@ -51,8 +52,16 @@ type Timeouts struct {
 
 // K8sApplier is the M3 hook. When nil, the orchestrator stops at BUILT
 // (used in M2 tests and dev runs without a kind cluster).
+//
+// M4 widens this interface to add Scale and Restart so the orchestrator
+// can delegate operational actions to the same component that owns the
+// k8s client. NopApplier satisfies the wider interface with no-op
+// implementations so tests and dev boots without a kind cluster keep
+// working unchanged.
 type K8sApplier interface {
 	Apply(ctx context.Context, deploymentID int64) error
+	Scale(ctx context.Context, app *application.Application, namespace string, replicas int) error
+	Restart(ctx context.Context, app *application.Application, namespace string) error
 }
 
 // NewOrchestrator wires dependencies. Caller owns the *Queries and
@@ -114,6 +123,27 @@ func (o *Orchestrator) IsActive(deploymentID int64) bool {
 	defer o.mu.Unlock()
 	_, ok := o.active[deploymentID]
 	return ok
+}
+
+// Scale patches the running Deployment's replica count (M4). When no
+// k8s applier is wired (M2 dev mode), the call is a no-op — there is
+// no Deployment to scale. Errors are returned to the caller; the API
+// handler turns them into a 502 with the underlying message.
+func (o *Orchestrator) Scale(ctx context.Context, app *application.Application, namespace string, replicas int) error {
+	if o.k8s == nil {
+		return errors.New("kubernetes unavailable: no applier wired")
+	}
+	return o.k8s.Scale(ctx, app, namespace, replicas)
+}
+
+// Restart deletes every pod owned by the app in the namespace; the
+// Deployment controller recreates them. Mirrors Scale's nil-applier
+// behaviour.
+func (o *Orchestrator) Restart(ctx context.Context, app *application.Application, namespace string) error {
+	if o.k8s == nil {
+		return errors.New("kubernetes unavailable: no applier wired")
+	}
+	return o.k8s.Restart(ctx, app, namespace)
 }
 
 // Run drives a single deployment through the pipeline. It blocks until
