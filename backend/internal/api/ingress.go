@@ -96,18 +96,18 @@ func (h *IngressURLHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusBadGateway)
 			_ = json.NewEncoder(w).Encode(map[string]string{
-				"error":   "app_unavailable",
-				"detail":  err.Error(),
+				"error":  "app_unavailable",
+				"detail": err.Error(),
 			})
 		}
 		return
 	}
 
 	resp := ingressURLResponse{
-		URL:           fwd.LocalURL(),
-		Port:          fwd.LocalPort(),
-		NS:            ns,
-		App:           appID,
+		URL:  fwd.LocalURL(),
+		Port: fwd.LocalPort(),
+		NS:   ns,
+		App:  appID,
 	}
 	w.Header().Set("Content-Type", "application/json")
 	w.WriteHeader(http.StatusOK)
