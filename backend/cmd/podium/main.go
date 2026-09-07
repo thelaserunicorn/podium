@@ -21,6 +21,7 @@ import (
 	"github.com/podium/podium/internal/auth"
 	"github.com/podium/podium/internal/deployment"
 	"github.com/podium/podium/internal/docker"
+	"github.com/podium/podium/internal/ingress"
 	"github.com/podium/podium/internal/kubernetes"
 	"github.com/podium/podium/internal/storage"
 )
@@ -139,6 +140,21 @@ func run() error {
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
 
+	// App ingress: the reverse-proxy that surfaces deployed apps at
+	// /-/apps/{id}/{namespace}/. Mounted outside /api/ and outside
+	// RequireAuth (same trust model as `kubectl port-forward`); the
+	// proxy itself enforces login by reading the user from context.
+	// The router is closed on graceful shutdown so all kubectl
+	// port-forward subprocesses die with Podium.
+	var ingressRouter *ingress.Router
+	if k8sClient != nil {
+		ingressRouter = ingress.NewRouter(queries, k8sClient, appSvc, logger)
+		ingressProxy := ingress.NewProxy(ingressRouter, logger)
+		api.NewIngressHandler(ingressRouter, ingressProxy, logger).Mount(mux)
+	} else {
+		logger.Warn("ingress disabled; /-/apps/* paths will return 503 until a Kubernetes cluster is reachable")
+	}
+
 	handler := api.New(mux, api.Deps{Auth: authSvc, Logger: logger})
 
 	srv := &http.Server{
@@ -162,6 +178,9 @@ func run() error {
 		return err
 	case <-ctx.Done():
 		logger.Info("podium shutting down")
+		if ingressRouter != nil {
+			ingressRouter.Close()
+		}
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		return srv.Shutdown(shutdownCtx)

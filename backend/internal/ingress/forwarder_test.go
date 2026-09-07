@@ -24,7 +24,7 @@ type fakeRunner struct {
 	// dialUpstream, if set, makes proxyConn dial this address instead
 	// of using `backend`. Proxy tests use this to point the fake at
 	// an httptest.Server.
-	dialUpstream  string
+	dialUpstream string
 	// readyListener, if true, makes the fake use a real TCP listener
 	// on the requested local port (so DialContext succeeds).
 	// Otherwise the fake just emits the readiness line and returns

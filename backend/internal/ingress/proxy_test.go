@@ -123,7 +123,7 @@ func TestProxy_StreamsBody(t *testing.T) {
 			}
 		}
 	})
-	rec := setup.request(t, "GET", "/-/apps/"+strconv.FormatInt(setup.appID, 10) + "/podium-dev/", nil)
+	rec := setup.request(t, "GET", "/-/apps/"+strconv.FormatInt(setup.appID, 10)+"/podium-dev/", nil)
 	if rec.Code != 200 {
 		t.Fatalf("status=%d body=%s", rec.Code, rec.Body.String())
 	}
@@ -139,7 +139,7 @@ func TestProxy_AnonymousReturns401(t *testing.T) {
 	setup := newUpstreamProxySetup(t, func(w http.ResponseWriter, r *http.Request) {
 		t.Error("upstream should not be called for anonymous request")
 	})
-	req := httptest.NewRequest("GET", "/-/apps/"+strconv.FormatInt(setup.appID, 10) + "/podium-dev/", nil)
+	req := httptest.NewRequest("GET", "/-/apps/"+strconv.FormatInt(setup.appID, 10)+"/podium-dev/", nil)
 	// No auth in context.
 	rec := httptest.NewRecorder()
 	setup.proxy.ServeHTTP(rec, req)
@@ -242,7 +242,7 @@ func TestProxy_Upstream502WhenForwarderDead(t *testing.T) {
 	r := NewRouter(store, &fakeBootstrap{}, appSvc, nil)
 	// Use a runner that dials nothing — Dial returns an error.
 	r.SetForwarderFactory(&fakeForwarderFactory{fake: &fakeRunner{
-		readyDelay: 5 * time.Millisecond,
+		readyDelay:   5 * time.Millisecond,
 		dialUpstream: "127.0.0.1:1", // closed port → dial fails
 	}})
 	r.SetPortRange(53000, 53000)
