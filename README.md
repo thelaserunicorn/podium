@@ -96,6 +96,7 @@ For step-by-step instructions tailored to your OS:
 - **macOS** — [docs/macos-setup.md](./docs/macos-setup.md) (TODO)
 - **Generic Linux** — [docs/ubuntu-setup.md](./docs/ubuntu-setup.md)
 - **Restart-from-cold checklist** — [docs/restart-checklist.md](./docs/restart-checklist.md) (agent-facing runbook for "it's been a while, just get it running")
+- **M7 next-steps handoff** — [docs/m7-next-steps.md](./docs/m7-next-steps.md) (the deferred smoke-script work, ready for a future agent)
 
 ## Demo script
 
