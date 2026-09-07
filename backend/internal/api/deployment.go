@@ -47,6 +47,7 @@ func (h *DeploymentHandler) Mount(mux *http.ServeMux) {
 	mux.Handle("POST /api/applications/{id}/scale", wrapped(h.Scale))
 	mux.Handle("POST /api/applications/{id}/restart", wrapped(h.Restart))
 	mux.Handle("GET /api/deployments/{id}", wrapped(h.GetDeployment))
+	mux.Handle("DELETE /api/deployments/{id}", wrapped(h.DeleteDeployment))
 	mux.Handle("GET /api/applications/{id}/deployments", wrapped(h.ListDeployments))
 	mux.Handle("GET /api/deployments/{id}/logs", wrapped(h.GetLogs))
 	mux.Handle("POST /api/deployments/{id}/rollback", wrapped(h.Rollback))
@@ -221,6 +222,43 @@ func (h *DeploymentHandler) GetDeployment(w http.ResponseWriter, r *http.Request
 	}
 	_ = app
 	writeJSON(w, http.StatusOK, map[string]any{"deployment": d})
+}
+
+// DeleteDeployment handles DELETE /api/deployments/{id}. It soft-deletes
+// the SQLite row (stamps deleted_at) and tears down the owning
+// application's Kubernetes resources in the deployment's namespace
+// (Deployment / Service / ConfigMap / Secret). Per DECISIONS.md E,
+// every app has exactly one Kubernetes Deployment per namespace — the
+// SQLite row is a version history, not an isolated runtime object, so
+// deleting any row tears down the same live Deployment.
+//
+// Returns:
+//   - 204 No Content on success.
+//   - 400 for a non-integer id.
+//   - 404 if the deployment doesn't exist, is already deleted, or
+//     belongs to another user (we never leak existence).
+//   - 500 for unexpected I/O failures.
+func (h *DeploymentHandler) DeleteDeployment(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	id, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid id")
+		return
+	}
+	if err := h.apps.DeleteDeployment(r.Context(), id, user.ID); err != nil {
+		if errors.Is(err, application.ErrNotFound) {
+			writeJSONError(w, http.StatusNotFound, "deployment not found")
+			return
+		}
+		h.logger.Error("delete deployment", "err", err, "deployment_id", id)
+		writeJSONError(w, http.StatusInternalServerError, "internal_error")
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
 }
 
 // scaleRequest is the JSON body for POST /api/applications/{id}/scale.

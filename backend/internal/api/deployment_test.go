@@ -127,6 +127,10 @@ func newFixture(t *testing.T) *fixture {
 		t.Fatalf("create app: %v", err)
 	}
 
+	// DeleteDeployment needs the queries handle; WithoutQueries is the
+	// historical default for older tests.
+	appSvc = appSvc.WithQueries(q)
+
 	mux := http.NewServeMux()
 	MountAuth(mux, auth.NewHandler(authSvc))
 	MountApplications(mux, application.NewHandler(appSvc))
@@ -760,4 +764,181 @@ func TestRollback_NegativeTargetVersionReturns400(t *testing.T) {
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("got %d want 400", rec.Code)
 	}
+}
+
+// TestDeleteDeployment_HappyPathSoftDeletesAndHidesFromList fires
+// a real deploy through the orchestrator, waits for it to finish,
+// then DELETE /api/deployments/{id}. Expects 204; the deployment
+// must vanish from GET /api/applications/{id}/deployments.
+func TestDeleteDeployment_HappyPathSoftDeletesAndHidesFromList(t *testing.T) {
+	f := newFixture(t)
+
+	depID := createAndWaitForTerminalDeployment(t, f)
+
+	req := httptest.NewRequest("DELETE", fmt.Sprintf("/api/deployments/%d", depID), nil)
+	req.Header.Set("Cookie", f.cookie)
+	rec := httptest.NewRecorder()
+	f.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNoContent {
+		t.Fatalf("DELETE: got %d want 204; body=%s", rec.Code, rec.Body.String())
+	}
+
+	// Confirm hidden from the per-app deployment list.
+	req = httptest.NewRequest("GET", fmt.Sprintf("/api/applications/%d/deployments?namespace=podium-dev", f.appID), nil)
+	req.Header.Set("Cookie", f.cookie)
+	rec = httptest.NewRecorder()
+	f.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("ListDeployments: %d %s", rec.Code, rec.Body.String())
+	}
+	var listed struct {
+		Deployments []*storage.Deployment `json:"deployments"`
+	}
+	_ = json.NewDecoder(rec.Body).Decode(&listed)
+	if len(listed.Deployments) != 0 {
+		t.Errorf("deleted deployment still in list: %d", len(listed.Deployments))
+	}
+
+	// Direct GetDeployment still finds the row but DeletedAt is set.
+	d, err := f.store.GetDeployment(context.Background(), depID)
+	if err != nil {
+		t.Fatalf("GetDeployment: %v", err)
+	}
+	if !d.DeletedAt.Valid {
+		t.Errorf("DeletedAt not stamped; got %+v", d)
+	}
+}
+
+// TestDeleteDeployment_RequiresAuth hits DELETE without a session
+// cookie and expects 401.
+func TestDeleteDeployment_RequiresAuth(t *testing.T) {
+	f := newFixture(t)
+	depID := createAndWaitForTerminalDeployment(t, f)
+
+	req := httptest.NewRequest("DELETE", fmt.Sprintf("/api/deployments/%d", depID), nil)
+	rec := httptest.NewRecorder()
+	f.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("DELETE without cookie: got %d want 401", rec.Code)
+	}
+}
+
+// TestDeleteDeployment_NotFoundForUnknownID confirms DELETE on an id
+// no one has ever seen returns 404.
+func TestDeleteDeployment_NotFoundForUnknownID(t *testing.T) {
+	f := newFixture(t)
+
+	req := httptest.NewRequest("DELETE", "/api/deployments/99999", nil)
+	req.Header.Set("Cookie", f.cookie)
+	rec := httptest.NewRecorder()
+	f.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("got %d want 404", rec.Code)
+	}
+}
+
+// TestDeleteDeployment_InvalidIDReturns400 confirms a non-integer
+// path segment is rejected with 400 (the contract from every other
+// handler in this package).
+func TestDeleteDeployment_InvalidIDReturns400(t *testing.T) {
+	f := newFixture(t)
+
+	req := httptest.NewRequest("DELETE", "/api/deployments/notanumber", nil)
+	req.Header.Set("Cookie", f.cookie)
+	rec := httptest.NewRecorder()
+	f.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("got %d want 400", rec.Code)
+	}
+}
+
+// TestDeleteDeployment_CrossUserReturns404 seeds a deployment
+// belonging to alice, then logs bob in (also APPROVED) and has him
+// try to delete it. The handler must return 404 — not 403 — to
+// avoid leaking existence (AGENTS.md §19).
+func TestDeleteDeployment_CrossUserReturns404(t *testing.T) {
+	f := newFixture(t)
+	depID := createAndWaitForTerminalDeployment(t, f)
+
+	// Login bob — fresh user, also APPROVED so the session goes through.
+	hash, _ := auth.HashPassword("bob-secret")
+	if _, err := f.store.DB().ExecContext(context.Background(),
+		`INSERT INTO users (username, email, password_hash, role, status) VALUES ('bob', 'bob@example.com', ?, 'USER', 'APPROVED')`,
+		hash); err != nil {
+		t.Fatalf("insert bob: %v", err)
+	}
+	body := bytes.NewBufferString(`{"username":"bob","password":"bob-secret"}`)
+	req := httptest.NewRequest("POST", "/api/auth/login", body)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	f.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("bob login: %d %s", rec.Code, rec.Body.String())
+	}
+	bobCookie := rec.Header().Get("Set-Cookie")
+	if i := strings.IndexByte(bobCookie, ';'); i > 0 {
+		bobCookie = bobCookie[:i]
+	}
+
+	req = httptest.NewRequest("DELETE", fmt.Sprintf("/api/deployments/%d", depID), nil)
+	req.Header.Set("Cookie", bobCookie)
+	rec = httptest.NewRecorder()
+	f.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusNotFound {
+		t.Errorf("cross-user DELETE: got %d want 404", rec.Code)
+	}
+
+	// And alice can still see it — the cross-user attempt didn't
+	// corrupt anything.
+	d, err := f.store.GetDeployment(context.Background(), depID)
+	if err != nil {
+		t.Fatalf("GetDeployment: %v", err)
+	}
+	if d.DeletedAt.Valid {
+		t.Errorf("cross-user DELETE should not have soft-deleted the row")
+	}
+}
+
+// TestDeleteDeployment_IdempotentSecondDeleteReturns404 fires two
+// DELETE requests in a row. The first returns 204, the second 404 —
+// a deleted row is invisible to a follow-up delete.
+func TestDeleteDeployment_IdempotentSecondDeleteReturns404(t *testing.T) {
+	f := newFixture(t)
+	depID := createAndWaitForTerminalDeployment(t, f)
+
+	for i := 1; i <= 2; i++ {
+		req := httptest.NewRequest("DELETE", fmt.Sprintf("/api/deployments/%d", depID), nil)
+		req.Header.Set("Cookie", f.cookie)
+		rec := httptest.NewRecorder()
+		f.mux.ServeHTTP(rec, req)
+		if i == 1 && rec.Code != http.StatusNoContent {
+			t.Fatalf("first DELETE: got %d want 204; body=%s", rec.Code, rec.Body.String())
+		}
+		if i == 2 && rec.Code != http.StatusNotFound {
+			t.Fatalf("second DELETE: got %d want 404", rec.Code)
+		}
+	}
+}
+
+// createAndWaitForTerminalDeployment is a small helper that fires
+// POST /api/applications/{id}/deploy and blocks until the orchestrator
+// finishes (BUILT or FAILED). Returns the deployment id.
+func createAndWaitForTerminalDeployment(t *testing.T, f *fixture) int64 {
+	t.Helper()
+	body := bytes.NewBufferString(`{"namespace":"podium-dev","replicas":1}`)
+	req := httptest.NewRequest("POST", fmt.Sprintf("/api/applications/%d/deploy", f.appID), body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Cookie", f.cookie)
+	rec := httptest.NewRecorder()
+	f.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("POST /deploy: %d %s", rec.Code, rec.Body.String())
+	}
+	var resp deployResponse
+	_ = json.NewDecoder(rec.Body).Decode(&resp)
+	if resp.Deployment == nil || resp.Deployment.ID == 0 {
+		t.Fatal("no deployment id")
+	}
+	waitForTerminal(t, f.store, resp.Deployment.ID, 2*time.Second)
+	return resp.Deployment.ID
 }
