@@ -38,6 +38,12 @@ type Options struct {
 // false the path is treated as a regular file; parent directories are created
 // with 0o755 and the file itself is opened with SQLite defaults (WAL is
 // enabled by us below).
+//
+// Absolute paths without an explicit URI scheme are promoted to
+// `file:<path>` automatically. modernc.org/sqlite otherwise mis-parses
+// the leading `/` as a scheme-relative URI and fails with
+// SQLITE_CANTOPEN (14). Relative paths (`data/podium.db`) and explicit
+// URI DSNs (`file:/data/podium.db?cache=shared`) pass through unchanged.
 func Open(ctx context.Context, dsn string, opts Options) (*sql.DB, error) {
 	if strings.TrimSpace(dsn) == "" {
 		return nil, errors.New("storage: empty DSN")
@@ -49,7 +55,7 @@ func Open(ctx context.Context, dsn string, opts Options) (*sql.DB, error) {
 		}
 	}
 
-	db, err := sql.Open("sqlite", dsn)
+	db, err := sql.Open("sqlite", NormalizeDSN(dsn, opts.InMemory))
 	if err != nil {
 		return nil, fmt.Errorf("storage: sql.Open: %w", err)
 	}
@@ -217,3 +223,31 @@ func ensureParentDir(dsn string) error {
 // doesn't import "os" directly. Keeping the helper local avoids needing
 // build-tagged files for a single, portable call.
 func mkdirAll(path string) error { return os.MkdirAll(path, 0o755) }
+
+// NormalizeDSN rewrites an absolute filesystem path into the modernc/sqlite
+// URI form when no scheme is already present. The driver otherwise interprets
+// the leading `/` as a scheme-relative URI (e.g. `/data/podium.db` becomes
+// `data/podium.db` under the current schema), which fails with
+// SQLITE_CANTOPEN. In-memory DSNs (containing `?mode=memory` or starting
+// with `file::memory:`) and explicit `file:` / `file:` schemes pass through
+// untouched.
+//
+// Exported so unit tests can verify the rewrite rules directly without
+// having to round-trip through Open().
+func NormalizeDSN(dsn string, inMemory bool) string {
+	if inMemory {
+		return dsn
+	}
+	if strings.HasPrefix(dsn, "file:") {
+		return dsn
+	}
+	// Treat any DSN with a scheme:// as already URI-form (e.g.
+	// `https://...`) — we don't expect such inputs but be conservative.
+	if i := strings.Index(dsn, "://"); i >= 0 && i < 16 {
+		return dsn
+	}
+	if strings.HasPrefix(dsn, "/") {
+		return "file:" + dsn
+	}
+	return dsn
+}

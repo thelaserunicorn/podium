@@ -117,10 +117,61 @@ func TestOpenPersistsToFile(t *testing.T) {
 	}
 }
 
-// TestDefaultEnvironmentsSeeded verifies that the three default namespaces
-// from DECISIONS.md C are inserted by 0001_init.sql.
-// Per DECISIONS.md C, environments ARE namespaces; we model them as a single
-// table with `namespace` as the unique key.
+// TestOpenAbsolutePathWorks is a regression test for the modernc/sqlite
+// SQLITE_CANTOPEN bug exposed by the M7 Dockerfile. Absolute DSNs like
+// `/data/podium.db` were being mis-parsed as scheme-relative URIs;
+// Open() now coerces them to `file:/data/podium.db` automatically.
+func TestOpenAbsolutePathWorks(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	// t.TempDir() returns an absolute path on Unix; appending a filename
+	// gives us an absolute DSN with a leading `/`.
+	dsn := filepath.Join(dir, "abs.db")
+
+	db, err := storage.Open(context.Background(), dsn, storage.Options{})
+	if err != nil {
+		t.Fatalf("Open with absolute path %q: %v", dsn, err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	var v int
+	if err := db.QueryRow(`PRAGMA user_version`).Scan(&v); err != nil {
+		t.Fatalf("ping after absolute-path open: %v", err)
+	}
+	if v < 1 {
+		t.Fatalf("expected user_version >= 1 after migrations, got %d", v)
+	}
+}
+
+// TestNormalizeDSNTable is a focused unit test on the DSN-coercion helper.
+// Exposed via storage.NormalizeDSN so we don't need a _test-only bridge.
+func TestNormalizeDSNTable(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		in   string
+		mem  bool
+		want string
+	}{
+		{"relative path passes through", "data/podium.db", false, "data/podium.db"},
+		{"absolute path gets file: prefix", "/data/podium.db", false, "file:/data/podium.db"},
+		{"explicit file: passes through", "file:/data/podium.db", false, "file:/data/podium.db"},
+		{"file: with query string passes through", "file:/data/p.db?cache=shared", false, "file:/data/p.db?cache=shared"},
+		{"memory URI passes through", "file::memory:", true, "file::memory:"},
+		{"memory URI in non-memory mode still passes through", "file:test.db?mode=memory", false, "file:test.db?mode=memory"},
+		{"scheme:// not double-prefixed", "https://example.com/db", false, "https://example.com/db"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			got := storage.NormalizeDSN(tc.in, tc.mem)
+			if got != tc.want {
+				t.Errorf("NormalizeDSN(%q, inMemory=%v) = %q; want %q", tc.in, tc.mem, got, tc.want)
+			}
+		})
+	}
+}
 func TestDefaultEnvironmentsSeeded(t *testing.T) {
 	t.Parallel()
 
