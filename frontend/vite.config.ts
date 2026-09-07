@@ -17,20 +17,6 @@ export default defineConfig({
         target: "http://localhost:8080",
         changeOrigin: false,
       },
-      // Proxy the ingress path tree too, so the same-origin URL built
-      // by buildIngressURL reaches the Go reverse proxy instead of
-      // Vite's SPA fallback (which would otherwise serve index.html,
-      // mount React Router, and the catch-all <Route path="*"> would
-      // bounce the user to /dashboard).
-      //
-      // The key starts with "^" so Vite treats it as a regex (see
-      // doesProxyContextMatchUrl in vite/dist). `-` is not a regex
-      // metacharacter outside character classes, so we don't need to
-      // escape it.
-      "^/-/apps(/.*)?$": {
-        target: "http://localhost:8080",
-        changeOrigin: false,
-      },
     },
   },
 });

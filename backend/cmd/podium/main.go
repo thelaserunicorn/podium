@@ -140,19 +140,19 @@ func run() error {
 		_, _ = w.Write([]byte(`{"status":"ok"}`))
 	})
 
-	// App ingress: the reverse-proxy that surfaces deployed apps at
-	// /-/apps/{id}/{namespace}/. Mounted outside /api/ and outside
-	// RequireAuth (same trust model as `kubectl port-forward`); the
-	// proxy itself enforces login by reading the user from context.
-	// The router is closed on graceful shutdown so all kubectl
-	// port-forward subprocesses die with Podium.
+	// App ingress: per-app localhost port-forward. The router starts
+	// a kubectl port-forward eagerly for each (app, ns) on demand;
+	// the frontend gets the URL via
+	// GET /api/applications/{id}/ingress?ns=... and opens it in a
+	// new tab. We do NOT mount a Go reverse proxy at /-/apps/* — the
+	// browser talks directly to kubectl, which avoids all the SPA
+	// rewrite complications.
 	var ingressRouter *ingress.Router
 	if k8sClient != nil {
 		ingressRouter = ingress.NewRouter(queries, k8sClient, appSvc, logger)
-		ingressProxy := ingress.NewProxy(ingressRouter, logger)
-		api.NewIngressHandler(ingressRouter, ingressProxy, logger).Mount(mux)
+		api.MountIngressURL(mux, api.NewIngressURLHandler(ingressRouter, logger))
 	} else {
-		logger.Warn("ingress disabled; /-/apps/* paths will return 503 until a Kubernetes cluster is reachable")
+		logger.Warn("ingress disabled; /api/applications/{id}/ingress will return 502 until a Kubernetes cluster is reachable")
 	}
 
 	handler := api.New(mux, api.Deps{Auth: authSvc, Logger: logger})

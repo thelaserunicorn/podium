@@ -106,6 +106,14 @@ func (f *Forwarder) SetReadyTimeout(d time.Duration) {
 // tests and for the Router's port allocator.
 func (f *Forwarder) LocalPort() int { return f.localPort }
 
+// LocalURL returns the URL the user can open in a browser to see the
+// proxied app. Format: "http://127.0.0.1:<port>". The Forwarder must
+// have been Start()ed first; the URL only resolves once kubectl is
+// bound to the local port.
+func (f *Forwarder) LocalURL() string {
+	return fmt.Sprintf("http://127.0.0.1:%d", f.localPort)
+}
+
 // Start launches the kubectl port-forward subprocess and blocks
 // until it signals readiness (by printing
 // `Forwarding from 127.0.0.1:<local> -> ...` to stderr) or until

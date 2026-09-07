@@ -1,75 +1,131 @@
 package api
 
 import (
+	"encoding/json"
+	"errors"
+	"fmt"
 	"log/slog"
 	"net/http"
+	"strconv"
 
 	"github.com/podium/podium/internal/auth"
 	"github.com/podium/podium/internal/ingress"
 )
 
-// IngressHandler exposes the reverse-proxy entry point at
+// ingressURLResponse is the JSON shape returned by
+// GET /api/applications/{id}/ingress. The browser opens `url` in a
+// new tab; the user sees the proxied app at its own localhost port.
+type ingressURLResponse struct {
+	URL  string `json:"url"`            // http://127.0.0.1:<port>
+	Port int    `json:"port"`           // bare port number, for display
+	NS   string `json:"namespace"`      // echoed for client convenience
+	App  int64  `json:"application_id"` // echoed for client convenience
+}
+
+// IngressURLHandler serves GET /api/applications/{id}/ingress?ns=...
 //
-//	/-/apps/{id}/{namespace}/ and /-/apps/{id}/{namespace}/{rest...}
+// The endpoint:
+//  1. Requires an authenticated session.
+//  2. Resolves the application by (id, caller-user) — users can only
+//     ingress their own apps (404 otherwise).
+//  3. Asks the ingress.Router to allocate (or reuse) a Forwarder for
+//     (id, ns). The Router eagerly starts the kubectl port-forward,
+//     so by the time this handler returns, the URL is reachable.
 //
-// The route lives OUTSIDE the standard /api/ prefix and OUTSIDE the
-// RequireAuth wrapper — proxied apps do not carry Podium session
-// cookies, and the trust model is "localhost-only tunnel" (the same
-// model `kubectl port-forward` uses).
-//
-// Authentication: the middleware chain sets the user in the request
-// context (auth.WithUser) for any request that arrived with a valid
-// session cookie, even on /-/ paths. The proxy reads its own
-// AuthUser-shaped value via ingress.WithAuthUser; see the shim
-// inside Mount for the bridge.
-//
-// On graceful shutdown the caller is expected to invoke Close
-// (Stop() on every kubectl port-forward the proxy kept warm).
-type IngressHandler struct {
-	proxy  *ingress.Proxy
+// The Forwarder is owned by the Router — once started it stays
+// alive until Podium shuts down (Router.Close) or the process dies.
+// We deliberately do not stop it after each request; re-dialing
+// across requests would re-create the subprocess each time.
+type IngressURLHandler struct {
 	router *ingress.Router
 	logger *slog.Logger
 }
 
-// NewIngressHandler wires the handler around a configured
-// Router + Proxy. The router is also retained so main.go can call
-// Close() on graceful shutdown.
-func NewIngressHandler(router *ingress.Router, proxy *ingress.Proxy, logger *slog.Logger) *IngressHandler {
+func NewIngressURLHandler(router *ingress.Router, logger *slog.Logger) *IngressURLHandler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &IngressHandler{proxy: proxy, router: router, logger: logger}
+	return &IngressURLHandler{router: router, logger: logger}
 }
 
-// authUserAdapter satisfies ingress.AuthUser using the auth.User
-// already on the context. Defined in api (not auth) so the ingress
-// package stays decoupled from the auth package — the plan file
-// covers the cycle in proxy.go.
-type authUserAdapter struct{ u *auth.User }
-
-func (a *authUserAdapter) UserID() int64 { return a.u.ID }
-
-// Mount registers the ingress proxy on the given mux. The shim wraps
-// p.ServeHTTP so it can pull the *auth.User off the context (placed
-// there by withSession) and re-publish it as an ingress.AuthUser.
+// ServeHTTP implements http.Handler.
 //
-// Wrapping order: shim -> proxy.ServeHTTP. The shim never blocks —
-// it just rewrites the context value and calls through.
-func (h *IngressHandler) Mount(mux *http.ServeMux) {
-	shim := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		u, _ := auth.UserFromContext(r.Context())
-		if u != nil {
-			ctx := ingress.WithAuthUser(r.Context(), &authUserAdapter{u: u})
-			r = r.WithContext(ctx)
+// Query parameters:
+//
+//	ns — required. Kubernetes namespace the app is deployed to.
+//
+// Responses:
+//
+//	200 — {url, port, namespace, application_id}
+//	400 — missing/invalid ns
+//	404 — unknown app / namespace
+//	502 — kubectl failed to start the port-forward (caller sees the
+//	      underlying error in the JSON body)
+func (h *IngressURLHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok || user == nil {
+		http.Error(w, `{"error":"unauthorized"}`, http.StatusUnauthorized)
+		return
+	}
+
+	appID, err := pathInt64(r, "id")
+	if err != nil || appID <= 0 {
+		http.Error(w, `{"error":"invalid application id"}`, http.StatusBadRequest)
+		return
+	}
+
+	ns := r.URL.Query().Get("ns")
+	if ns == "" {
+		http.Error(w, `{"error":"missing ns query parameter"}`, http.StatusBadRequest)
+		return
+	}
+
+	fwd, err := h.router.Lookup(r.Context(), appID, ns, user.ID)
+	if err != nil {
+		switch {
+		case errors.Is(err, ingress.ErrNoSuchApp):
+			http.Error(w, `{"error":"application not found"}`, http.StatusNotFound)
+		case errors.Is(err, ingress.ErrNoSuchNamespace):
+			http.Error(w, fmt.Sprintf(`{"error":%q}`, err.Error()), http.StatusNotFound)
+		default:
+			h.logger.Error("ingress lookup",
+				slog.Int64("app_id", appID),
+				slog.String("ns", ns),
+				slog.String("err", err.Error()),
+			)
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusBadGateway)
+			_ = json.NewEncoder(w).Encode(map[string]string{
+				"error":   "app_unavailable",
+				"detail":  err.Error(),
+			})
 		}
-		h.proxy.ServeHTTP(w, r)
-	})
-	// Path-based routing under /-/apps/. The proxy handles every
-	// /-/apps/{id}/{namespace}/... shape; the prefix match is done by
-	// Go's stdlib ServeMux.
-	mux.Handle("/-/apps/", shim)
+		return
+	}
+
+	resp := ingressURLResponse{
+		URL:           fwd.LocalURL(),
+		Port:          fwd.LocalPort(),
+		NS:            ns,
+		App:           appID,
+	}
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+	_ = json.NewEncoder(w).Encode(resp)
 }
 
-// Router exposes the underlying router so main.go can release the
-// port-forwards on shutdown.
-func (h *IngressHandler) Router() *ingress.Router { return h.router }
+// pathInt64 is a small helper for extracting a {id} path segment as
+// int64. The standard library's PathValue returns a string; this is
+// the only place we need int64 conversion, so a tiny helper beats
+// adding a strconv import to multiple files.
+func pathInt64(r *http.Request, name string) (int64, error) {
+	return strconv.ParseInt(r.PathValue(name), 10, 64)
+}
+
+// MountIngressURL registers the /api/applications/{id}/ingress
+// endpoint on the mux, wrapped in RequireAuth. The endpoint returns
+// the localhost URL of the kubectl port-forward for the app in the
+// requested namespace. main.go calls this once at startup.
+func MountIngressURL(mux *http.ServeMux, h *IngressURLHandler) {
+	mux.Handle("GET /api/applications/{id}/ingress", RequireAuth(h))
+}
