@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
-import { useParams } from "react-router-dom";
-import { History, Play, RefreshCw } from "lucide-react";
+import { useNavigate, useParams } from "react-router-dom";
+import { History, Play, RefreshCw, Trash2 } from "lucide-react";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
@@ -9,6 +9,8 @@ import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
 import { K8sOverview } from "@/components/K8sOverview";
 import { EnvVarsPanel } from "@/components/EnvVarsPanel";
+import { AppLogsTab } from "@/components/AppLogsTab";
+import { AppEventsTab } from "@/components/AppEventsTab";
 
 interface Application {
   id: number;
@@ -51,11 +53,18 @@ interface LogLine {
 
 export function AppDetailPage() {
   const { id } = useParams<{ id: string }>();
+  const navigate = useNavigate();
   const [app, setApp] = useState<Application | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [namespaces, setNamespaces] = useState<NamespaceRow[]>([]);
   const [namespace, setNamespace] = useState<string>("podium-dev");
-  const [tab, setTab] = useState<"overview" | "deployments" | "env">("overview");
+  const [tab, setTab] = useState<"overview" | "deployments" | "logs" | "events" | "env">(
+    "overview",
+  );
+  // Latest deployment id (per namespace). The Events tab scopes its
+  // view to this deployment; the Deployments tab updates it whenever
+  // the user picks a row in the history list.
+  const [latestDeploymentID, setLatestDeploymentID] = useState<number | null>(null);
 
   useEffect(() => {
     if (!id) return;
@@ -92,6 +101,25 @@ export function AppDetailPage() {
   if (!app) {
     return <p className="text-sm text-muted-foreground">Loading…</p>;
   }
+  // Local copy so the deleteApp closure narrows on a single immutable
+  // ref — avoids TS seeing `app` as `Application | null` again.
+  const a: Application = app;
+
+  async function deleteApp() {
+    if (
+      !window.confirm(
+        `Delete application "${a.name}"? All deployments and Kubernetes resources will be torn down.`,
+      )
+    ) {
+      return;
+    }
+    try {
+      await api.del<void>(`/api/applications/${a.id}`);
+      navigate("/apps");
+    } catch (e) {
+      setError((e as Error).message);
+    }
+  }
 
   return (
     <div className="space-y-6">
@@ -118,6 +146,16 @@ export function AppDetailPage() {
             </select>
           </div>
           <Badge variant="secondary">v{app.version}</Badge>
+          <Button
+            size="sm"
+            variant="ghost"
+            onClick={() => void deleteApp()}
+            title="Delete application and tear down all Kubernetes resources"
+            className="text-muted-foreground hover:text-destructive"
+          >
+            <Trash2 className="h-4 w-4" />
+            Delete
+          </Button>
         </div>
       </div>
 
@@ -127,6 +165,8 @@ export function AppDetailPage() {
             [
               ["overview", "Overview"],
               ["deployments", "Deployments"],
+              ["logs", "Logs"],
+              ["events", "Events"],
               ["env", "Env vars"],
             ] as const
           ).map(([key, label]) => (
@@ -179,7 +219,33 @@ export function AppDetailPage() {
             <CardTitle>Deployments</CardTitle>
           </CardHeader>
           <CardContent>
-            <DeploymentsTab appId={app.id} namespace={namespace} />
+            <DeploymentsTab
+              appId={app.id}
+              namespace={namespace}
+              onSelect={(d) => setLatestDeploymentID(d.id)}
+            />
+          </CardContent>
+        </Card>
+      )}
+
+      {tab === "logs" && (
+        <Card>
+          <CardHeader>
+            <CardTitle>Logs</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <AppLogsTab appId={app.id} namespace={namespace} />
+          </CardContent>
+        </Card>
+      )}
+
+      {tab === "events" && (
+        <Card>
+          <CardHeader>
+            <CardTitle>Events</CardTitle>
+          </CardHeader>
+          <CardContent>
+            <AppEventsTab namespace={namespace} deploymentId={latestDeploymentID} />
           </CardContent>
         </Card>
       )}
@@ -207,7 +273,18 @@ function Row({ label, value }: { label: string; value: string }) {
   );
 }
 
-function DeploymentsTab({ appId, namespace }: { appId: number; namespace: string }) {
+function DeploymentsTab({
+  appId,
+  namespace,
+  onSelect,
+}: {
+  appId: number;
+  namespace: string;
+  // Notified whenever the user picks a row — the parent uses this
+  // to drive the Events tab's deploymentId so events get scoped to
+  // the user's chosen attempt.
+  onSelect?: (d: Deployment) => void;
+}) {
   const [deployments, setDeployments] = useState<Deployment[] | null>(null);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -259,6 +336,7 @@ function DeploymentsTab({ appId, namespace }: { appId: number; namespace: string
       });
       await load();
       setSelected(res.deployment);
+      onSelect?.(res.deployment);
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -286,6 +364,37 @@ function DeploymentsTab({ appId, namespace }: { appId: number; namespace: string
       );
       await load();
       setSelected(res.deployment);
+      onSelect?.(res.deployment);
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function deleteDeployment(d: Deployment) {
+    // The M5 delete tears down the live Kubernetes resources for the
+    // owning app in the deployment's namespace (per
+    // backend/internal/application/deployment_delete.go). Confirm
+    // because the user cannot undo this — once it's gone, the live
+    // pods are gone too.
+    if (
+      !window.confirm(
+        `Delete deployment #${d.id} (${d.image})? The live app in ${namespace} will be torn down.`,
+      )
+    ) {
+      return;
+    }
+    setBusy(true);
+    setError(null);
+    try {
+      await api.del<void>(`/api/deployments/${d.id}`);
+      // Clear the build-log viewer if the user just deleted the row
+      // it was showing.
+      if (selected && selected.id === d.id) {
+        setSelected(null);
+      }
+      await load();
     } catch (e) {
       setError((e as Error).message);
     } finally {
@@ -343,7 +452,10 @@ function DeploymentsTab({ appId, namespace }: { appId: number; namespace: string
               <li
                 key={d.id}
                 className="flex cursor-pointer items-center justify-between px-3 py-2 text-sm hover:bg-muted/50"
-                onClick={() => setSelected(d)}
+                onClick={() => {
+                  setSelected(d);
+                  onSelect?.(d);
+                }}
               >
                 <div className="flex items-center gap-3">
                   <span className="font-mono text-xs">#{d.id}</span>
@@ -369,6 +481,19 @@ function DeploymentsTab({ appId, namespace }: { appId: number; namespace: string
                       Roll back
                     </Button>
                   )}
+                  <Button
+                    size="sm"
+                    variant="ghost"
+                    disabled={busy}
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      void deleteDeployment(d);
+                    }}
+                    title="Delete this deployment and tear down the live app"
+                    className="text-muted-foreground hover:text-destructive"
+                  >
+                    <Trash2 className="h-4 w-4" />
+                  </Button>
                 </div>
               </li>
             ))}
