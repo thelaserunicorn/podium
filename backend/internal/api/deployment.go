@@ -14,6 +14,7 @@ import (
 	"github.com/podium/podium/internal/application"
 	"github.com/podium/podium/internal/auth"
 	"github.com/podium/podium/internal/deployment"
+	"github.com/podium/podium/internal/kubernetes"
 	"github.com/podium/podium/internal/storage"
 )
 
@@ -43,6 +44,8 @@ func (h *DeploymentHandler) Mount(mux *http.ServeMux) {
 		return RequireAuth(http.HandlerFunc(handler))
 	}
 	mux.Handle("POST /api/applications/{id}/deploy", wrapped(h.Deploy))
+	mux.Handle("POST /api/applications/{id}/scale", wrapped(h.Scale))
+	mux.Handle("POST /api/applications/{id}/restart", wrapped(h.Restart))
 	mux.Handle("GET /api/deployments/{id}", wrapped(h.GetDeployment))
 	mux.Handle("GET /api/applications/{id}/deployments", wrapped(h.ListDeployments))
 	mux.Handle("GET /api/deployments/{id}/logs", wrapped(h.GetLogs))
@@ -217,6 +220,147 @@ func (h *DeploymentHandler) GetDeployment(w http.ResponseWriter, r *http.Request
 	}
 	_ = app
 	writeJSON(w, http.StatusOK, map[string]any{"deployment": d})
+}
+
+// scaleRequest is the JSON body for POST /api/applications/{id}/scale.
+type scaleRequest struct {
+	Namespace string `json:"namespace"`
+	Replicas  *int   `json:"replicas"`
+}
+
+// Scale handles POST /api/applications/{id}/scale. It validates
+// ownership and the replica range (1..5 per spec.md §19) and
+// delegates to the orchestrator. Returns:
+//
+//   - 200 OK with { deployment_name, current_replicas, desired_replicas }
+//     on success.
+//   - 400 for invalid namespace / replica count.
+//   - 404 if the app doesn't exist or isn't owned by the caller.
+//   - 502 when the k8s applier errored (no kubeconfig, deployment
+//     missing, etc.).
+func (h *DeploymentHandler) Scale(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	appID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid application id")
+		return
+	}
+	app, err := h.apps.Get(r.Context(), appID, user.ID)
+	if err != nil {
+		if errors.Is(err, application.ErrNotFound) {
+			writeJSONError(w, http.StatusNotFound, "application not found")
+			return
+		}
+		h.logger.Error("get application", "err", err)
+		writeJSONError(w, http.StatusInternalServerError, "internal_error")
+		return
+	}
+
+	var req scaleRequest
+	if r.ContentLength > 0 {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid json")
+			return
+		}
+	}
+	namespace := req.Namespace
+	if namespace == "" {
+		namespace = "podium-dev"
+	}
+	if err := application.ValidateNamespaceName(namespace); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid namespace: "+err.Error())
+		return
+	}
+	if req.Replicas == nil {
+		writeJSONError(w, http.StatusBadRequest, "replicas required")
+		return
+	}
+	replicas := *req.Replicas
+	if replicas < 1 || replicas > 5 {
+		writeJSONError(w, http.StatusBadRequest, "replicas must be 1..5")
+		return
+	}
+
+	if err := h.orch.Scale(r.Context(), &app, namespace, replicas); err != nil {
+		h.logger.Error("scale deployment", "err", err, "app", appID, "ns", namespace)
+		writeJSONError(w, http.StatusBadGateway, "scale_failed: "+err.Error())
+		return
+	}
+
+	depName := kubernetes.DeploymentName(app.Name, app.ID)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"application_id":   app.ID,
+		"namespace":        namespace,
+		"deployment_name":  depName,
+		"desired_replicas": replicas,
+	})
+}
+
+// restartRequest is the JSON body for POST /api/applications/{id}/restart.
+type restartRequest struct {
+	Namespace string `json:"namespace"`
+}
+
+// Restart handles POST /api/applications/{id}/restart. Same
+// ownership / namespace validation as Scale; delegates to the
+// orchestrator. The orchestrator deletes the pods; the Deployment
+// controller recreates them. UI should poll the state endpoint to
+// see the new pods come up.
+func (h *DeploymentHandler) Restart(w http.ResponseWriter, r *http.Request) {
+	user, ok := auth.UserFromContext(r.Context())
+	if !ok {
+		writeJSONError(w, http.StatusUnauthorized, "unauthorized")
+		return
+	}
+	appID, err := strconv.ParseInt(r.PathValue("id"), 10, 64)
+	if err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid application id")
+		return
+	}
+	app, err := h.apps.Get(r.Context(), appID, user.ID)
+	if err != nil {
+		if errors.Is(err, application.ErrNotFound) {
+			writeJSONError(w, http.StatusNotFound, "application not found")
+			return
+		}
+		h.logger.Error("get application", "err", err)
+		writeJSONError(w, http.StatusInternalServerError, "internal_error")
+		return
+	}
+
+	var req restartRequest
+	if r.ContentLength > 0 {
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			writeJSONError(w, http.StatusBadRequest, "invalid json")
+			return
+		}
+	}
+	namespace := req.Namespace
+	if namespace == "" {
+		namespace = "podium-dev"
+	}
+	if err := application.ValidateNamespaceName(namespace); err != nil {
+		writeJSONError(w, http.StatusBadRequest, "invalid namespace: "+err.Error())
+		return
+	}
+
+	if err := h.orch.Restart(r.Context(), &app, namespace); err != nil {
+		h.logger.Error("restart deployment", "err", err, "app", appID, "ns", namespace)
+		writeJSONError(w, http.StatusBadGateway, "restart_failed: "+err.Error())
+		return
+	}
+
+	depName := kubernetes.DeploymentName(app.Name, app.ID)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"application_id":  app.ID,
+		"namespace":       namespace,
+		"deployment_name": depName,
+		"restarted_at":    storage.FormatPodTS(time.Now()),
+	})
 }
 
 // ListDeployments returns the deployment history for an app in a

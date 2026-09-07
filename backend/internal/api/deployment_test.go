@@ -5,6 +5,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -315,6 +316,210 @@ func TestDeploy_RejectsInvalidNamespace(t *testing.T) {
 	f.mux.ServeHTTP(rec, req)
 	if rec.Code != http.StatusBadRequest {
 		t.Errorf("got %d want 400", rec.Code)
+	}
+}
+
+// recordingApplier implements deployment.K8sApplier. The fixture's
+// default fixture (newFixture) wires no k8s applier so Scale/Restart
+// tests would 502 by default; this stub lets us assert the handler
+// forwards the right args when a real applier is wired.
+type recordingApplier struct {
+	mu       sync.Mutex
+	scales   []scaleCall
+	restarts []restartCall
+	err      error
+}
+
+type scaleCall struct {
+	app      *application.Application
+	ns       string
+	replicas int
+}
+
+type restartCall struct {
+	app *application.Application
+	ns  string
+}
+
+func (r *recordingApplier) Apply(_ context.Context, _ int64) error { return nil }
+
+func (r *recordingApplier) Scale(_ context.Context, app *application.Application, ns string, replicas int) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.scales = append(r.scales, scaleCall{app: app, ns: ns, replicas: replicas})
+	return r.err
+}
+
+func (r *recordingApplier) Restart(_ context.Context, app *application.Application, ns string) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.restarts = append(r.restarts, restartCall{app: app, ns: ns})
+	return r.err
+}
+
+// fixtureWithApplier rebuilds the mux with a working orchestrator so
+// Scale / Restart can exercise the happy path. It mirrors the shape of
+// newFixture but lets the test inject the applier.
+func fixtureWithApplier(t *testing.T, applier deployment.K8sApplier) *fixture {
+	t.Helper()
+	f := newFixture(t)
+
+	orch := deployment.NewOrchestrator(f.store, f.builder, f.fetcher, t.TempDir(),
+		deployment.Timeouts{Build: 5 * time.Second}, applier)
+	h := NewDeploymentHandler(f.store, application.NewService(f.store.DB()), orch, nil)
+	fresh := http.NewServeMux()
+	MountAuth(fresh, auth.NewHandler(auth.NewService(f.store.DB())))
+	MountApplications(fresh, application.NewHandler(application.NewService(f.store.DB())))
+	h.Mount(fresh)
+	wrapped := New(fresh, Deps{Auth: auth.NewService(f.store.DB())})
+	f.mux = wrapped
+	f.orch = orch
+	return f
+}
+
+func TestScale_HappyPathForwardsToApplier(t *testing.T) {
+	app := &recordingApplier{}
+	f := fixtureWithApplier(t, app)
+
+	body := bytes.NewBufferString(`{"namespace":"podium-dev","replicas":4}`)
+	req := httptest.NewRequest("POST", "/api/applications/1/scale", body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Cookie", f.cookie)
+	rec := httptest.NewRecorder()
+	f.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("scale: %d %s", rec.Code, rec.Body.String())
+	}
+
+	app.mu.Lock()
+	defer app.mu.Unlock()
+	if len(app.scales) != 1 {
+		t.Fatalf("scales=%d want 1", len(app.scales))
+	}
+	got := app.scales[0]
+	if got.ns != "podium-dev" {
+		t.Errorf("ns=%q want podium-dev", got.ns)
+	}
+	if got.replicas != 4 {
+		t.Errorf("replicas=%d want 4", got.replicas)
+	}
+	if got.app == nil || got.app.ID != f.appID {
+		t.Errorf("app mismatch: %+v", got.app)
+	}
+}
+
+func TestScale_RejectsBadReplicas(t *testing.T) {
+	f := fixtureWithApplier(t, &recordingApplier{})
+	for _, n := range []int{0, 6, -1} {
+		body := bytes.NewBufferString(fmt.Sprintf(`{"namespace":"podium-dev","replicas":%d}`, n))
+		req := httptest.NewRequest("POST", "/api/applications/1/scale", body)
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Cookie", f.cookie)
+		rec := httptest.NewRecorder()
+		f.mux.ServeHTTP(rec, req)
+		if rec.Code != http.StatusBadRequest {
+			t.Errorf("replicas=%d got %d want 400", n, rec.Code)
+		}
+	}
+}
+
+func TestScale_RejectsMissingReplicas(t *testing.T) {
+	f := fixtureWithApplier(t, &recordingApplier{})
+	body := bytes.NewBufferString(`{"namespace":"podium-dev"}`)
+	req := httptest.NewRequest("POST", "/api/applications/1/scale", body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Cookie", f.cookie)
+	rec := httptest.NewRecorder()
+	f.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("got %d want 400", rec.Code)
+	}
+}
+
+func TestScale_RequiresAuth(t *testing.T) {
+	f := fixtureWithApplier(t, &recordingApplier{})
+	body := bytes.NewBufferString(`{"namespace":"podium-dev","replicas":2}`)
+	req := httptest.NewRequest("POST", "/api/applications/1/scale", body)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	f.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("got %d want 401", rec.Code)
+	}
+}
+
+func TestScale_ApplierErrorBecomes502(t *testing.T) {
+	f := fixtureWithApplier(t, &recordingApplier{err: errors.New("connection refused")})
+	body := bytes.NewBufferString(`{"namespace":"podium-dev","replicas":3}`)
+	req := httptest.NewRequest("POST", "/api/applications/1/scale", body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Cookie", f.cookie)
+	rec := httptest.NewRecorder()
+	f.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("got %d want 502", rec.Code)
+	}
+}
+
+func TestRestart_HappyPathForwardsToApplier(t *testing.T) {
+	app := &recordingApplier{}
+	f := fixtureWithApplier(t, app)
+
+	body := bytes.NewBufferString(`{"namespace":"podium-staging"}`)
+	req := httptest.NewRequest("POST", "/api/applications/1/restart", body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Cookie", f.cookie)
+	rec := httptest.NewRecorder()
+	f.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusOK {
+		t.Fatalf("restart: %d %s", rec.Code, rec.Body.String())
+	}
+
+	app.mu.Lock()
+	defer app.mu.Unlock()
+	if len(app.restarts) != 1 {
+		t.Fatalf("restarts=%d want 1", len(app.restarts))
+	}
+	if got := app.restarts[0]; got.ns != "podium-staging" || got.app == nil || got.app.ID != f.appID {
+		t.Errorf("restart args mismatch: %+v", got)
+	}
+}
+
+func TestRestart_RejectsInvalidNamespace(t *testing.T) {
+	f := fixtureWithApplier(t, &recordingApplier{})
+	body := bytes.NewBufferString(`{"namespace":"Bad Name"}`)
+	req := httptest.NewRequest("POST", "/api/applications/1/restart", body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Cookie", f.cookie)
+	rec := httptest.NewRecorder()
+	f.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadRequest {
+		t.Errorf("got %d want 400", rec.Code)
+	}
+}
+
+func TestRestart_RequiresAuth(t *testing.T) {
+	f := fixtureWithApplier(t, &recordingApplier{})
+	body := bytes.NewBufferString(`{"namespace":"podium-dev"}`)
+	req := httptest.NewRequest("POST", "/api/applications/1/restart", body)
+	req.Header.Set("Content-Type", "application/json")
+	rec := httptest.NewRecorder()
+	f.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusUnauthorized {
+		t.Errorf("got %d want 401", rec.Code)
+	}
+}
+
+func TestRestart_ApplierErrorBecomes502(t *testing.T) {
+	f := fixtureWithApplier(t, &recordingApplier{err: errors.New("connection refused")})
+	body := bytes.NewBufferString(`{"namespace":"podium-dev"}`)
+	req := httptest.NewRequest("POST", "/api/applications/1/restart", body)
+	req.Header.Set("Content-Type", "application/json")
+	req.Header.Set("Cookie", f.cookie)
+	rec := httptest.NewRecorder()
+	f.mux.ServeHTTP(rec, req)
+	if rec.Code != http.StatusBadGateway {
+		t.Errorf("got %d want 502", rec.Code)
 	}
 }
 
