@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { Layers, Plus } from "lucide-react";
 import { api } from "@/lib/api";
+import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
@@ -175,25 +176,25 @@ function Stat({
   label: string;
   value: string;
   hint?: string;
-  // Tints the card surface so a glance at the dashboard tells the
-  // operator the overall shape of the fleet before they read any
-  // numbers. `neutral` (default) leaves the Card untouched so the
-  // "Applications" total stays visually quiet next to the colored
-  // status cards.
+  // Recolors just the big number so the operator sees fleet health
+  // at a glance without the whole card turning into a colored block.
+  // `neutral` (default) leaves the value at the standard foreground
+  // color so the "Applications" total stays quiet next to the
+  // colored status numbers.
   //
-  // Uses inline Tailwind palette classes (emerald-50 / red-50) —
-  // same pattern as K8sOverview's podPhaseVariant badge colors. When
-  // we ship dark mode, swap these for semantic tokens defined in
+  // Inline Tailwind palette classes (emerald-700 / red-700) — same
+  // pattern as K8sOverview's podPhaseVariant badge colors. When we
+  // ship dark mode, swap these for semantic tokens defined in
   // index.css so they flip with the theme.
   tone?: "neutral" | "success" | "destructive";
 }) {
-  const surface =
-    tone === "success" ? "bg-emerald-50" : tone === "destructive" ? "bg-red-50" : null;
+  const valueClass =
+    tone === "success" ? "text-emerald-700" : tone === "destructive" ? "text-red-700" : null;
   return (
-    <Card className={surface ?? undefined}>
+    <Card>
       <CardContent className="pt-6">
         <p className="text-xs uppercase tracking-wide text-muted-foreground">{label}</p>
-        <p className="mt-1 text-2xl font-semibold">{value}</p>
+        <p className={cn("mt-1 text-2xl font-semibold", valueClass ?? undefined)}>{value}</p>
         {hint && <p className="text-xs text-muted-foreground">{hint}</p>}
       </CardContent>
     </Card>
