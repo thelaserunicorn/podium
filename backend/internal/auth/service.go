@@ -230,6 +230,32 @@ func (s *Service) DisableUser(ctx context.Context, userID int64) error {
 	return s.setStatus(ctx, userID, StatusDisabled)
 }
 
+// DeleteUser hard-deletes a user row. Caller-supplied callerID is checked
+// against the target so an admin cannot delete themselves and lock out
+// Podium; passing the same id for both returns ErrCannotDeleteSelf. All
+// child rows (applications, deployments, environment_variables, sessions,
+// deploy_log_lines) cascade away via the ON DELETE CASCADE foreign keys
+// declared in migrations/0001_init.sql. Returns ErrUserNotFound when the
+// target id does not exist. Admin-only by convention — the HTTP handler
+// enforces the role check.
+func (s *Service) DeleteUser(ctx context.Context, callerID, targetID int64) error {
+	if callerID == targetID {
+		return ErrCannotDeleteSelf
+	}
+	res, err := s.db.ExecContext(ctx, `DELETE FROM users WHERE id = ?`, targetID)
+	if err != nil {
+		return fmt.Errorf("auth: delete user: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("auth: rows affected: %w", err)
+	}
+	if n == 0 {
+		return ErrUserNotFound
+	}
+	return nil
+}
+
 // SetUserStatus is the lower-level setter used by tests and by future
 // admin endpoints that need finer control. It validates the status string
 // against the allowed set so a typo cannot persist an invalid value.

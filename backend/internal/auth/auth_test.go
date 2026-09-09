@@ -512,3 +512,153 @@ func TestSessionTokenFormat(t *testing.T) {
 		}
 	}
 }
+
+// DeleteUser tests -------------------------------------------------------
+
+// TestDeleteUserRemovesRow verifies a successful hard-delete removes the
+// user row. We then re-signup with the same username — if the row were
+// still present the UNIQUE constraint would fail.
+func TestDeleteUserRemovesRow(t *testing.T) {
+	t.Parallel()
+	db := newTestDB(t)
+	svc := auth.NewService(db)
+
+	in := auth.SignupInput{
+		Username: uniqueUsername(t, "del"),
+		Email:    "del@example.com",
+		Password: "goodpassword",
+	}
+	user, err := svc.Signup(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Signup: %v", err)
+	}
+	// Seed a separate caller row so callerID (its id) is guaranteed !=
+	// targetID (user.ID). SQLite autoincrement gives the first inserted
+	// user id 1, and user.ID is also 1 in a fresh DB — so callerID must be
+	// a distinct row.
+	if err := auth.SeedAdmin(context.Background(), db, "caller-admin", "goodpassword"); err != nil {
+		t.Fatalf("SeedAdmin: %v", err)
+	}
+	caller, err := svc.ListUsers(context.Background())
+	if err != nil {
+		t.Fatalf("ListUsers: %v", err)
+	}
+	var callerID int64
+	for _, u := range caller {
+		if u.Username == "caller-admin" {
+			callerID = u.ID
+			break
+		}
+	}
+	if callerID == 0 {
+		t.Fatal("seeded admin not found")
+	}
+	if callerID == user.ID {
+		t.Fatalf("test setup invariant: callerID (%d) must differ from user.ID (%d)", callerID, user.ID)
+	}
+	if err := svc.DeleteUser(context.Background(), callerID, user.ID); err != nil {
+		t.Fatalf("DeleteUser: %v", err)
+	}
+	if _, err := svc.Signup(context.Background(), in); err != nil {
+		t.Fatalf("Signup with previously-deleted username should succeed: %v", err)
+	}
+}
+
+// TestDeleteUserRejectsSelf verifies the self-protection guard. Passing the
+// same id for caller and target must return ErrCannotDeleteSelf and leave
+// the row in place.
+func TestDeleteUserRejectsSelf(t *testing.T) {
+	t.Parallel()
+	svc := newSvc(t)
+
+	in := auth.SignupInput{
+		Username: uniqueUsername(t, "self"),
+		Email:    "self@example.com",
+		Password: "goodpassword",
+	}
+	user, err := svc.Signup(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Signup: %v", err)
+	}
+
+	err = svc.DeleteUser(context.Background(), user.ID, user.ID)
+	if !errors.Is(err, auth.ErrCannotDeleteSelf) {
+		t.Fatalf("expected ErrCannotDeleteSelf, got %v", err)
+	}
+
+	users, err := svc.ListUsers(context.Background())
+	if err != nil {
+		t.Fatalf("ListUsers: %v", err)
+	}
+	var found bool
+	for _, u := range users {
+		if u.ID == user.ID {
+			found = true
+			break
+		}
+	}
+	if !found {
+		t.Fatalf("user %d was deleted despite self-protection", user.ID)
+	}
+}
+
+// TestDeleteUserUnknownID verifies the unknown-id path returns
+// ErrUserNotFound (same shape as setStatus so the HTTP layer can map it).
+func TestDeleteUserUnknownID(t *testing.T) {
+	t.Parallel()
+	svc := newSvc(t)
+
+	err := svc.DeleteUser(context.Background(), 1, 9999)
+	if !errors.Is(err, auth.ErrUserNotFound) {
+		t.Fatalf("expected ErrUserNotFound, got %v", err)
+	}
+}
+
+// TestDeleteUserCascadesSessions verifies the FK CASCADE on sessions: the
+// deleted user's active session token must no longer resolve.
+func TestDeleteUserCascadesSessions(t *testing.T) {
+	t.Parallel()
+	db := newTestDB(t)
+	svc := auth.NewService(db)
+
+	in := auth.SignupInput{
+		Username: uniqueUsername(t, "cascade"),
+		Email:    "cascade@example.com",
+		Password: "goodpassword",
+	}
+	user, err := svc.Signup(context.Background(), in)
+	if err != nil {
+		t.Fatalf("Signup: %v", err)
+	}
+	_ = svc.ApproveUser(context.Background(), user.ID)
+	sess, err := svc.Login(context.Background(), in.Username, in.Password)
+	if err != nil {
+		t.Fatalf("Login: %v", err)
+	}
+	// Seed a separate caller row so callerID != user.ID (which is 1 in a
+	// fresh DB — the same id hard-coded below would trip the self-protection).
+	if err := auth.SeedAdmin(context.Background(), db, "caller-admin", "goodpassword"); err != nil {
+		t.Fatalf("SeedAdmin: %v", err)
+	}
+	caller, err := svc.ListUsers(context.Background())
+	if err != nil {
+		t.Fatalf("ListUsers: %v", err)
+	}
+	var callerID int64
+	for _, u := range caller {
+		if u.Username == "caller-admin" {
+			callerID = u.ID
+			break
+		}
+	}
+	if callerID == user.ID {
+		t.Fatalf("test setup invariant: callerID (%d) must differ from user.ID (%d)", callerID, user.ID)
+	}
+
+	if err := svc.DeleteUser(context.Background(), callerID, user.ID); err != nil {
+		t.Fatalf("DeleteUser: %v", err)
+	}
+	if _, err := svc.LoadSession(context.Background(), sess.Token); !errors.Is(err, auth.ErrSessionNotFound) {
+		t.Fatalf("expected session to be cascaded away, got %v", err)
+	}
+}

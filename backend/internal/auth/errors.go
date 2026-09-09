@@ -16,4 +16,5 @@ var (
 	ErrLoginBlocked       = errors.New("auth: login is not permitted for this account")
 	ErrSessionNotFound    = errors.New("auth: session not found or expired")
 	ErrUserNotFound       = errors.New("auth: user not found")
+	ErrCannotDeleteSelf   = errors.New("auth: cannot delete yourself")
 )
