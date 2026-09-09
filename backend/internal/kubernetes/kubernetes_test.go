@@ -169,3 +169,51 @@ func TestDeriveKindClusterName(t *testing.T) {
 		}
 	}
 }
+
+// TestDeleteNamespace_RemovesResource: happy path. The namespace
+// disappears from the fake clientset after Delete.
+func TestDeleteNamespace_RemovesResource(t *testing.T) {
+	ctx := context.Background()
+	c := newTestClient(t)
+
+	if err := c.EnsureNamespace(ctx, "smoke-test"); err != nil {
+		t.Fatalf("seed: %v", err)
+	}
+	if _, err := c.CS.CoreV1().Namespaces().Get(ctx, "smoke-test", metav1.GetOptions{}); err != nil {
+		t.Fatalf("namespace not present after seed: %v", err)
+	}
+
+	if err := c.DeleteNamespace(ctx, "smoke-test"); err != nil {
+		t.Fatalf("DeleteNamespace: %v", err)
+	}
+	if _, err := c.CS.CoreV1().Namespaces().Get(ctx, "smoke-test", metav1.GetOptions{}); err == nil {
+		t.Fatal("namespace still present after delete")
+	}
+}
+
+// TestDeleteNamespace_NotFoundIsOk: deleting a name that was never
+// created must NOT surface an error — the admin endpoint calls this
+// after wiping SQLite, and a SQLite row can exist without a
+// corresponding K8s namespace if the cluster was down at create-time.
+func TestDeleteNamespace_NotFoundIsOk(t *testing.T) {
+	ctx := context.Background()
+	c := newTestClient(t)
+
+	if err := c.DeleteNamespace(ctx, "ghost"); err != nil {
+		t.Fatalf("DeleteNamespace on missing: %v", err)
+	}
+}
+
+// TestDeleteNamespace_RejectsBadName: same DNS-1123 validation as
+// EnsureNamespace — callers must not be able to slip invalid names
+// through this side of the pair.
+func TestDeleteNamespace_RejectsBadName(t *testing.T) {
+	c := newTestClient(t)
+	err := c.DeleteNamespace(context.Background(), "BadName")
+	if err == nil {
+		t.Fatal("expected error for invalid DNS-1123 name")
+	}
+	if !errors.Is(err, application.ErrInvalidNamespace) {
+		t.Errorf("err=%v, want application.ErrInvalidNamespace", err)
+	}
+}

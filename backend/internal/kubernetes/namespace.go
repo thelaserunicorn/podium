@@ -38,3 +38,23 @@ func (c *Client) EnsureNamespace(ctx context.Context, name string) error {
 	}
 	return nil
 }
+
+// DeleteNamespace removes a Kubernetes namespace. Garbage collection
+// cascades to every Deployment / Service / ConfigMap / Secret / Pod
+// inside it — that is the whole point of calling this from the admin
+// "delete namespace" endpoint. Idempotent: a namespace that does not
+// exist (already deleted, or never created in the cluster because the
+// SQLite row was orphaned) returns nil. DNS-1123 validation matches
+// EnsureNamespace so callers can use either side of the pair safely.
+func (c *Client) DeleteNamespace(ctx context.Context, name string) error {
+	if err := application.ValidateNamespaceName(name); err != nil {
+		return fmt.Errorf("kubernetes: %w", err)
+	}
+	if err := c.CS.CoreV1().Namespaces().Delete(ctx, name, metav1.DeleteOptions{}); err != nil {
+		if apierrors.IsNotFound(err) {
+			return nil
+		}
+		return fmt.Errorf("kubernetes: delete namespace %q: %w", name, err)
+	}
+	return nil
+}
