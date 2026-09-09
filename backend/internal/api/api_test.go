@@ -426,3 +426,102 @@ func TestMiddlewarePanicRecover(t *testing.T) {
 func quietLogger() *slog.Logger {
 	return slog.New(slog.NewTextHandler(io.Discard, &slog.HandlerOptions{Level: slog.LevelError}))
 }
+
+// TestAdminDeleteUser: an admin can delete another user. After the call,
+// the user is gone from /api/admin/users and the deleted user's session
+// token no longer authenticates.
+func TestAdminDeleteUser(t *testing.T) {
+	t.Parallel()
+	env := newTestEnv(t)
+
+	// Alice has a session (env.aliceTok). Capture her id.
+	resp, body := httpJSON(t, "DELETE",
+		fmt.Sprintf("%s/api/admin/users/%d", env.server.URL, env.aliceID),
+		nil, authHeader(env.adminTok))
+	if resp.StatusCode != 200 {
+		t.Fatalf("delete: status %d, body=%s", resp.StatusCode, body)
+	}
+
+	// Alice's session must no longer authenticate.
+	resp, body = httpJSON(t, "GET", env.server.URL+"/api/auth/me", nil, authHeader(env.aliceTok))
+	if resp.StatusCode != 401 {
+		t.Fatalf("deleted user session still valid: status %d, body=%s", resp.StatusCode, body)
+	}
+
+	// Alice must no longer appear in the admin list.
+	resp, body = httpJSON(t, "GET", env.server.URL+"/api/admin/users", nil, authHeader(env.adminTok))
+	if resp.StatusCode != 200 {
+		t.Fatalf("list: %d %s", resp.StatusCode, body)
+	}
+	if strings.Contains(string(body), "\"username\":\"alice-") {
+		t.Fatalf("deleted user still in list: %s", body)
+	}
+}
+
+// TestAdminDeleteSelfRejected: an admin cannot delete themselves. The
+// endpoint returns 400 and the admin row is preserved.
+func TestAdminDeleteSelfRejected(t *testing.T) {
+	t.Parallel()
+	env := newTestEnv(t)
+
+	resp, body := httpJSON(t, "DELETE",
+		fmt.Sprintf("%s/api/admin/users/%d", env.server.URL, env.adminID),
+		nil, authHeader(env.adminTok))
+	if resp.StatusCode != 400 {
+		t.Fatalf("self-delete: status %d, body=%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "cannot_delete_self") {
+		t.Fatalf("expected cannot_delete_self error code, got %s", body)
+	}
+
+	// Admin must still be listed and still able to call /me.
+	resp, body = httpJSON(t, "GET", env.server.URL+"/api/auth/me", nil, authHeader(env.adminTok))
+	if resp.StatusCode != 200 {
+		t.Fatalf("admin session broken after self-delete attempt: %d %s", resp.StatusCode, body)
+	}
+}
+
+// TestAdminDisableSelfRejected: same self-protection as delete, applied
+// retroactively to the existing /disable endpoint. An admin must not be
+// able to lock themselves out by self-disabling.
+func TestAdminDisableSelfRejected(t *testing.T) {
+	t.Parallel()
+	env := newTestEnv(t)
+
+	resp, body := httpJSON(t, "POST",
+		fmt.Sprintf("%s/api/admin/users/%d/disable", env.server.URL, env.adminID),
+		nil, authHeader(env.adminTok))
+	if resp.StatusCode != 400 {
+		t.Fatalf("self-disable: status %d, body=%s", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), "cannot_target_self") {
+		t.Fatalf("expected cannot_target_self error code, got %s", body)
+	}
+}
+
+// TestAdminDeleteUnknownID: deleting a non-existent user returns 404.
+func TestAdminDeleteUnknownID(t *testing.T) {
+	t.Parallel()
+	env := newTestEnv(t)
+
+	resp, body := httpJSON(t, "DELETE",
+		fmt.Sprintf("%s/api/admin/users/999999", env.server.URL),
+		nil, authHeader(env.adminTok))
+	if resp.StatusCode != 404 {
+		t.Fatalf("delete unknown: status %d, body=%s", resp.StatusCode, body)
+	}
+}
+
+// TestAdminDeleteRequiresAdmin: non-admin users cannot hit the delete
+// endpoint — RequireAdmin returns 403.
+func TestAdminDeleteRequiresAdmin(t *testing.T) {
+	t.Parallel()
+	env := newTestEnv(t)
+
+	resp, body := httpJSON(t, "DELETE",
+		fmt.Sprintf("%s/api/admin/users/%d", env.server.URL, env.adminID),
+		nil, authHeader(env.aliceTok))
+	if resp.StatusCode != 403 {
+		t.Fatalf("non-admin delete: status %d, body=%s", resp.StatusCode, body)
+	}
+}

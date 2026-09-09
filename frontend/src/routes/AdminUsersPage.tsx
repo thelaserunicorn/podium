@@ -1,8 +1,17 @@
 import { useEffect, useState } from "react";
 import { api } from "@/lib/api";
+import { useAuth } from "@/lib/auth";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 
 interface AdminUser {
   id: number;
@@ -15,9 +24,13 @@ interface AdminUser {
 }
 
 export function AdminUsersPage() {
+  const { user: currentUser } = useAuth();
   const [users, setUsers] = useState<AdminUser[] | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [busy, setBusy] = useState<number | null>(null);
+  // The id of the user pending delete confirmation. When non-null the
+  // Dialog is open.
+  const [pendingDelete, setPendingDelete] = useState<AdminUser | null>(null);
 
   async function load() {
     try {
@@ -44,11 +57,31 @@ export function AdminUsersPage() {
     }
   }
 
+  // confirmDelete is invoked from the Dialog. DELETE is its own verb on the
+  // service so it doesn't share the act() helper, which is for POST actions.
+  async function confirmDelete() {
+    if (!pendingDelete) return;
+    const target = pendingDelete;
+    setBusy(target.id);
+    setError(null);
+    try {
+      await api.del(`/api/admin/users/${target.id}`);
+      setPendingDelete(null);
+      await load();
+    } catch (e) {
+      setError((e as Error).message);
+    } finally {
+      setBusy(null);
+    }
+  }
+
   return (
     <div className="space-y-6">
       <div>
         <h1 className="text-2xl font-semibold">Users</h1>
-        <p className="text-sm text-muted-foreground">Approve, reject, or disable accounts.</p>
+        <p className="text-sm text-muted-foreground">
+          Approve, reject, disable, or delete accounts.
+        </p>
       </div>
 
       <Card>
@@ -73,55 +106,114 @@ export function AdminUsersPage() {
                 </tr>
               </thead>
               <tbody>
-                {users.map((u) => (
-                  <tr key={u.id} className="border-b border-border">
-                    <td className="py-2 font-medium">{u.username}</td>
-                    <td className="py-2 text-muted-foreground">{u.email}</td>
-                    <td className="py-2 text-muted-foreground">{u.role}</td>
-                    <td className="py-2">
-                      <Badge variant={statusVariant(u.status)}>{u.status}</Badge>
-                    </td>
-                    <td className="py-2 text-right">
-                      <div className="flex justify-end gap-2">
-                        {u.status === "PENDING" && (
-                          <>
+                {users.map((u) => {
+                  // Admins cannot target themselves for either disable or
+                  // delete (server-side enforces this too, but hiding the
+                  // buttons makes the UI match reality).
+                  const isSelf = currentUser?.id === u.id;
+                  return (
+                    <tr key={u.id} className="border-b border-border">
+                      <td className="py-2 font-medium">{u.username}</td>
+                      <td className="py-2 text-muted-foreground">{u.email}</td>
+                      <td className="py-2 text-muted-foreground">{u.role}</td>
+                      <td className="py-2">
+                        <Badge variant={statusVariant(u.status)}>{u.status}</Badge>
+                      </td>
+                      <td className="py-2 text-right">
+                        <div className="flex justify-end gap-2">
+                          {u.status === "PENDING" && (
+                            <>
+                              <Button
+                                size="sm"
+                                variant="default"
+                                disabled={busy === u.id}
+                                onClick={() => void act(u.id, "approve")}
+                              >
+                                Approve
+                              </Button>
+                              <Button
+                                size="sm"
+                                variant="destructive"
+                                disabled={busy === u.id}
+                                onClick={() => void act(u.id, "reject")}
+                              >
+                                Reject
+                              </Button>
+                            </>
+                          )}
+                          {u.status === "APPROVED" && !isSelf && (
                             <Button
                               size="sm"
-                              variant="default"
+                              variant="outline"
                               disabled={busy === u.id}
-                              onClick={() => void act(u.id, "approve")}
+                              onClick={() => void act(u.id, "disable")}
                             >
-                              Approve
+                              Disable
                             </Button>
+                          )}
+                          {!isSelf && (
                             <Button
                               size="sm"
                               variant="destructive"
                               disabled={busy === u.id}
-                              onClick={() => void act(u.id, "reject")}
+                              onClick={() => setPendingDelete(u)}
                             >
-                              Reject
+                              Delete
                             </Button>
-                          </>
-                        )}
-                        {u.status === "APPROVED" && u.role !== "ADMIN" && (
-                          <Button
-                            size="sm"
-                            variant="outline"
-                            disabled={busy === u.id}
-                            onClick={() => void act(u.id, "disable")}
-                          >
-                            Disable
-                          </Button>
-                        )}
-                      </div>
-                    </td>
-                  </tr>
-                ))}
+                          )}
+                        </div>
+                      </td>
+                    </tr>
+                  );
+                })}
               </tbody>
             </table>
           )}
         </CardContent>
       </Card>
+
+      <Dialog
+        open={pendingDelete !== null}
+        onOpenChange={(open) => {
+          // Only allow closing via explicit cancel / X — confirmation
+          // resets busy state and the parent form. While a delete request
+          // is in flight we lock the dialog open.
+          if (!open && busy === null) setPendingDelete(null);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Delete user?</DialogTitle>
+            <DialogDescription>
+              {pendingDelete && (
+                <>
+                  This will permanently remove{" "}
+                  <span className="font-medium text-foreground">{pendingDelete.username}</span>{" "}
+                  along with their applications, deployments, and sessions. Kubernetes resources
+                  owned by their applications will be orphaned in the cluster. This action cannot be
+                  undone.
+                </>
+              )}
+            </DialogDescription>
+          </DialogHeader>
+          <DialogFooter>
+            <Button
+              variant="outline"
+              disabled={busy !== null}
+              onClick={() => setPendingDelete(null)}
+            >
+              Cancel
+            </Button>
+            <Button
+              variant="destructive"
+              disabled={busy !== null}
+              onClick={() => void confirmDelete()}
+            >
+              {busy !== null ? "Deleting…" : "Delete"}
+            </Button>
+          </DialogFooter>
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
