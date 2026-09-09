@@ -75,11 +75,13 @@ export function DashboardPage() {
           label="Running"
           value={apps === null ? "—" : String(running)}
           hint={apps === null ? undefined : "Latest deployment status across apps"}
+          tone="success"
         />
         <Stat
           label="Failed"
           value={apps === null ? "—" : String(failed)}
           hint={apps === null ? undefined : "Latest deployment status across apps"}
+          tone="destructive"
         />
       </div>
 
@@ -164,9 +166,31 @@ function StatusBadge({ status }: { status: LatestStatus["status"] }) {
   return <Badge variant={variant}>{status.toLowerCase()}</Badge>;
 }
 
-function Stat({ label, value, hint }: { label: string; value: string; hint?: string }) {
+function Stat({
+  label,
+  value,
+  hint,
+  tone,
+}: {
+  label: string;
+  value: string;
+  hint?: string;
+  // Tints the card surface so a glance at the dashboard tells the
+  // operator the overall shape of the fleet before they read any
+  // numbers. `neutral` (default) leaves the Card untouched so the
+  // "Applications" total stays visually quiet next to the colored
+  // status cards.
+  //
+  // Uses inline Tailwind palette classes (emerald-50 / red-50) —
+  // same pattern as K8sOverview's podPhaseVariant badge colors. When
+  // we ship dark mode, swap these for semantic tokens defined in
+  // index.css so they flip with the theme.
+  tone?: "neutral" | "success" | "destructive";
+}) {
+  const surface =
+    tone === "success" ? "bg-emerald-50" : tone === "destructive" ? "bg-red-50" : null;
   return (
-    <Card>
+    <Card className={surface ?? undefined}>
       <CardContent className="pt-6">
         <p className="text-xs uppercase tracking-wide text-muted-foreground">{label}</p>
         <p className="mt-1 text-2xl font-semibold">{value}</p>
