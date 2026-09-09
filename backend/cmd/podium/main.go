@@ -123,6 +123,7 @@ func run() error {
 		api.NewK8sHandler(queries, appSvc, k8sClient, logger).Mount(mux)
 		api.NewEnvHandler(queries, appSvc, application.NewEnvService(db, k8sClient), logger).Mount(mux)
 		api.NewLogsHandler(queries, appSvc, k8sClient, logger).Mount(mux)
+		api.NewNamespacesHandler(queries, k8sClient, logger).Mount(mux)
 	} else {
 		// Still mount with a nil client so /state returns {available:false}.
 		api.NewK8sHandler(queries, appSvc, nil, logger).Mount(mux)
@@ -134,6 +135,10 @@ func run() error {
 		// cluster is missing so the diagnostics tabs render an empty
 		// "cluster not configured" state instead of a connection error.
 		api.NewLogsHandler(queries, appSvc, nil, logger).Mount(mux)
+		// Namespaces handler: list + create still work; admin delete
+		// falls back to SQLite-only cleanup. Matches the same
+		// graceful-degradation pattern as the other handlers above.
+		api.NewNamespacesHandler(queries, nil, logger).Mount(mux)
 	}
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, r *http.Request) {
 		w.WriteHeader(http.StatusOK)

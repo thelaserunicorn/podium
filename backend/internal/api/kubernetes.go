@@ -13,13 +13,17 @@ import (
 )
 
 // K8sHandler exposes the live Kubernetes state endpoints added in M3:
-// GET /api/applications/{id}/state and GET /api/namespaces.
+// GET /api/applications/{id}/state.
 //
 // State is the polled endpoint the Overview tab hits every ~5s; it
 // returns the running deployment name, current/desired replicas, the
 // matching pods, and an "available" flag so the UI can show a graceful
 // "cluster not configured" message instead of crashing when KUBECONFIG
 // is missing.
+//
+// Note: GET /api/namespaces moved to NamespacesHandler (M-namespaces
+// page) — it lives there so list/create/admin-delete can share the
+// same router and storage dependencies.
 type K8sHandler struct {
 	store  *storage.Queries
 	apps   *application.Service
@@ -36,13 +40,12 @@ func NewK8sHandler(store *storage.Queries, apps *application.Service, client *ku
 	return &K8sHandler{store: store, apps: apps, client: client, logger: logger}
 }
 
-// Mount registers the two routes.
+// Mount registers the route.
 func (h *K8sHandler) Mount(mux *http.ServeMux) {
 	wrapped := func(handler http.HandlerFunc) http.Handler {
 		return RequireAuth(http.HandlerFunc(handler))
 	}
 	mux.Handle("GET /api/applications/{id}/state", wrapped(h.GetAppState))
-	mux.Handle("GET /api/namespaces", wrapped(h.ListNamespaces))
 }
 
 // stateResponse is the JSON body returned by GET /api/applications/{id}/state.
@@ -145,17 +148,6 @@ func (h *K8sHandler) GetAppState(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, resp)
 }
 
-// ListNamespaces returns every row from the environments table. The
-// default namespaces appear first because ListEnvironments orders by
-// id ascending.
-func (h *K8sHandler) ListNamespaces(w http.ResponseWriter, r *http.Request) {
-	envs, err := h.store.ListEnvironments(r.Context())
-	if err != nil {
-		h.logger.Error("list environments", "err", err)
-		writeError(w, http.StatusInternalServerError, "internal_error", "")
-		return
-	}
-	out := make([]storage.Environment, 0, len(envs))
-	out = append(out, envs...)
-	writeJSON(w, http.StatusOK, map[string]any{"namespaces": out})
-}
+// ListNamespaces previously lived here; it moved to NamespacesHandler
+// when the namespaces-page feature landed so list/create/admin-delete
+// can share the same router and storage dependencies.
