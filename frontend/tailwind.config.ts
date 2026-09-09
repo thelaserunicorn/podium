@@ -2,6 +2,11 @@ import type { Config } from "tailwindcss";
 
 const config: Config = {
   content: ["./index.html", "./src/**/*.{ts,tsx}"],
+  // Class-based dark mode: the `.dark` class is toggled on <html> by
+  // src/lib/theme.tsx. Every existing `bg-background`, `text-foreground`,
+  // ... class automatically re-binds to the dark CSS variables — no
+  // `dark:` variants needed in the components themselves.
+  darkMode: ["class", ".dark"],
   theme: {
     extend: {
       colors: {
