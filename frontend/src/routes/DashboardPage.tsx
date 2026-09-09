@@ -123,48 +123,84 @@ export function DashboardPage() {
   );
 }
 
-// AppCard — one application in the dashboard grid. The card itself
-// is a Card primitive; clicking anywhere on it navigates to the
-// detail page (matches the "click a row" affordance the old list
-// provided). No destructive action here — Dashboard is read-only.
+// AppCard — one application in the dashboard grid. Mirrors the
+// AppListPage card shape so the two pages read as the same component:
+//
+//   - 4px top accent bar keyed off latest_status (RUNNING = emerald,
+//     FAILED = red, in-flight = amber, never deployed = neutral border)
+//   - Status badge top-right (emerald for RUNNING — NOT the blue
+//     "default" badge which made healthy apps look like a primary CTA)
+//   - Repository URL under the name
+//   - Compact metadata grid (Version / Namespace / Port)
+//
+// Dashboard is read-only — no Delete affordance. The whole card is
+// a Link so any click navigates to the detail page.
 function AppCard({ app: a }: { app: Application }) {
   const status = a.latest_status?.status ?? null;
-  const namespace = a.latest_status?.namespace ?? null;
   return (
-    <Link
-      to={`/apps/${a.id}`}
-      className="block rounded-lg border border-border bg-background p-4 transition-colors hover:bg-muted/50"
+    <div
+      className={cn(
+        "group flex flex-col overflow-hidden rounded-lg border border-border bg-background shadow-sm transition-all",
+        "hover:border-foreground/20 hover:shadow-md",
+      )}
     >
-      <div className="flex min-w-0 items-start justify-between gap-2">
-        <h3 className="truncate font-medium">{a.name}</h3>
-        {status && <StatusBadge status={status} />}
-      </div>
-      <dl className="mt-3 grid grid-cols-2 gap-y-1 text-xs text-muted-foreground">
-        <dt>Version</dt>
-        <dd className="text-right font-mono">v{a.version}</dd>
-        <dt>Namespace</dt>
-        <dd className="truncate text-right font-mono">{namespace ?? "—"}</dd>
-        <dt>Port</dt>
-        <dd className="text-right font-mono">{a.container_port}</dd>
-      </dl>
-    </Link>
+      {/* Status accent bar. Same heights/colors as AppListPage so a
+          card on /dashboard looks identical to its twin on /apps. */}
+      <div className={cn("h-1 w-full", statusAccent(status))} aria-hidden="true" />
+
+      <Link
+        to={`/apps/${a.id}`}
+        className="flex min-w-0 flex-1 flex-col p-4 transition-colors hover:bg-muted/30"
+      >
+        <div className="flex min-w-0 items-start justify-between gap-2">
+          <h3 className="truncate font-medium" title={a.name}>
+            {a.name}
+          </h3>
+          <span className="shrink-0 font-mono text-xs text-muted-foreground">v{a.version}</span>
+        </div>
+        <p className="mt-1 truncate text-xs text-muted-foreground" title={a.repository_url}>
+          {a.repository_url}
+        </p>
+
+        <div className="mt-3 flex items-center gap-2">
+          {status ? (
+            <Badge variant={statusBadgeVariant(status)}>{status.toLowerCase()}</Badge>
+          ) : (
+            <Badge variant="outline">never deployed</Badge>
+          )}
+        </div>
+
+        <dl className="mt-3 grid grid-cols-2 gap-y-1 text-xs text-muted-foreground">
+          <dt>Namespace</dt>
+          <dd className="truncate text-right font-mono">{a.latest_status?.namespace ?? "—"}</dd>
+          <dt>Port</dt>
+          <dd className="text-right font-mono">{a.container_port}</dd>
+        </dl>
+      </Link>
+    </div>
   );
 }
 
-function StatusBadge({ status }: { status: LatestStatus["status"] }) {
-  const variant =
-    status === "RUNNING"
-      ? "default"
-      : status === "FAILED"
-        ? "destructive"
-        : status === "QUEUED" ||
-            status === "BUILDING" ||
-            status === "BUILT" ||
-            status === "DEPLOYING" ||
-            status === "STARTING"
-          ? "secondary"
-          : "outline";
-  return <Badge variant={variant}>{status.toLowerCase()}</Badge>;
+// statusAccent returns the top-bar color for the given deployment
+// status. Same palette as AppListPage — duplicate on purpose to keep
+// each route file self-contained (these helpers will fold into a
+// shared status module once we add a third consumer).
+function statusAccent(s: LatestStatus["status"] | undefined | null): string {
+  if (!s) return "bg-border";
+  if (s === "RUNNING") return "bg-emerald-500";
+  if (s === "FAILED") return "bg-red-500";
+  return "bg-amber-500";
+}
+
+// statusBadgeVariant maps the same status to a Badge variant. RUNNING
+// uses "success" (emerald) — NOT the blue "default" — so a healthy
+// app reads as healthy at a glance instead of looking like a primary
+// CTA. FAILED uses "destructive" (red), everything in flight uses
+// the neutral "secondary" so an in-progress deploy doesn't shout.
+function statusBadgeVariant(s: LatestStatus["status"]) {
+  if (s === "RUNNING") return "success" as const;
+  if (s === "FAILED") return "destructive" as const;
+  return "secondary" as const;
 }
 
 function Stat({
