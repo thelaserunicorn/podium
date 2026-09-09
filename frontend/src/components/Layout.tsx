@@ -2,6 +2,7 @@ import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
 import { LayoutDashboard, Layers, ShieldCheck, LogOut, FileCode2, Boxes } from "lucide-react";
 import { useAuth } from "@/lib/auth";
 import { Button } from "@/components/ui/button";
+import { ThemeToggle } from "@/components/ThemeToggle";
 
 export function Layout() {
   const { user, signOut } = useAuth();
@@ -51,6 +52,7 @@ export function Layout() {
               {user?.username}
               <span className="ml-2 rounded bg-muted px-1.5 py-0.5 text-xs">{user?.role}</span>
             </span>
+            <ThemeToggle />
             <Button variant="ghost" size="sm" onClick={() => void signOut()}>
               <LogOut className="mr-1 h-4 w-4" />
               Sign out

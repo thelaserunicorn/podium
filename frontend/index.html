@@ -5,6 +5,30 @@
     <link rel="icon" type="image/svg+xml" href="/vite.svg" />
     <meta name="viewport" content="width=device-width, initial-scale=1.0" />
     <title>Podium</title>
+    <script>
+      // Theme bootstrap — runs before React mounts so the .dark
+      // class is on <html> from the very first paint. Without this,
+      // dark-mode users would see a flash of light on every
+      // navigation. Mirrors the resolveTheme() logic in
+      // src/lib/theme.tsx so the two stay in lockstep.
+      (function () {
+        try {
+          var stored = localStorage.getItem("podium-theme");
+          var mode =
+            stored === "light" || stored === "dark" || stored === "system" ? stored : "system";
+          var dark =
+            mode === "dark" ||
+            (mode === "system" &&
+              window.matchMedia &&
+              window.matchMedia("(prefers-color-scheme: dark)").matches);
+          if (dark) document.documentElement.classList.add("dark");
+        } catch (e) {
+          // localStorage may be disabled (Safari Private Mode). Skip
+          // — the page renders in light by default. The React toggle
+          // will still work; only persistence is affected.
+        }
+      })();
+    </script>
   </head>
   <body>
     <div id="root"></div>
