@@ -10,8 +10,13 @@
     --muted-foreground: 215.4 16.3% 46.9%;
     --accent: 210 40% 96.1%;
     --accent-foreground: 222.2 47.4% 11.2%;
-    --primary: 222.2 47.4% 11.2%;
-    --primary-foreground: 210 40% 98%;
+    /* Brand purple-blue (#1B17FF). Drives `default` buttons, default
+       badges, focus rings, slider thumbs, links — anything that
+       uses the semantic `primary` token. White-on-#1B17FF clears
+       WCAG AA (4.5:1) and AAA (7:1) text contrast.
+       hsl(241 100% 55%) == rgb(27,23,255). */
+    --primary: 241 100% 55%;
+    --primary-foreground: 0 0% 100%;
     --destructive: 0 84.2% 60.2%;
     --destructive-foreground: 210 40% 98%;
     --border: 214.3 31.8% 91.4%;
