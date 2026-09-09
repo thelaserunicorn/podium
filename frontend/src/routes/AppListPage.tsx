@@ -2,9 +2,21 @@ import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { Layers, Plus, Trash2 } from "lucide-react";
 import { api } from "@/lib/api";
+import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
+import { Badge } from "@/components/ui/badge";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+
+// LatestStatus mirrors the field shape on /api/applications when
+// enriched by the backend's join — same shape DashboardPage consumes.
+interface LatestStatus {
+  deployment_id: number;
+  status: "QUEUED" | "BUILDING" | "BUILT" | "DEPLOYING" | "STARTING" | "RUNNING" | "FAILED";
+  version: number;
+  namespace: string;
+  created_at: string;
+}
 
 interface Application {
   id: number;
@@ -13,6 +25,9 @@ interface Application {
   container_port: number;
   version: number;
   updated_at: string;
+  // Backend's GET /api/applications may include latest_status
+  // depending on the join path; we tolerate either form.
+  latest_status?: LatestStatus | null;
 }
 
 export function AppListPage() {
@@ -132,11 +147,45 @@ export function AppListPage() {
   );
 }
 
-// AppCard — one application in the grid. The card is a clickable
-// surface that navigates to the detail page (matching the row-click
-// affordance the old table provided). The delete Button stops
-// propagation so clicking it opens the confirm modal instead of
-// navigating.
+// statusAccent returns the top-bar color for the given deployment
+// status. The bar is a 4px horizontal stripe above the card body —
+// a glance at the grid tells the operator which apps are healthy,
+// which are mid-deploy, and which are dead. Keys:
+//
+//   RUNNING       → emerald-500  (success / live)
+//   FAILED        → red-500      (destructive)
+//   in-flight     → amber-500    (QUEUED/BUILDING/BUILT/DEPLOYING/STARTING)
+//   no status     → border (neutral)
+//
+// Inline palette classes mirror the rest of the codebase (K8sOverview,
+// DashboardPage's Stat tone). When we have a semantic token table for
+// status colors we can promote these.
+function statusAccent(s: LatestStatus["status"] | undefined | null): string {
+  if (!s) return "bg-border";
+  if (s === "RUNNING") return "bg-emerald-500";
+  if (s === "FAILED") return "bg-red-500";
+  return "bg-amber-500";
+}
+
+// statusBadgeVariant maps the same status to a Badge variant. The
+// enum covers every value the backend's deployment_status CHECK
+// constraint can return.
+function statusBadgeVariant(s: LatestStatus["status"]) {
+  if (s === "RUNNING") return "success" as const;
+  if (s === "FAILED") return "destructive" as const;
+  return "secondary" as const;
+}
+
+// AppCard — one application in the grid. The card body is a Link
+// that navigates to the detail page; the Delete button lives in the
+// footer and stops propagation so clicking it opens the confirm
+// modal instead of navigating.
+//
+// Redesign (vs the old plain surface):
+//   - 4px top accent bar keyed to the latest deployment status
+//   - Status badge in the top-right next to the version pill
+//   - Tighter metadata row (namespace + port) under the URL
+//   - Subtle hover lift via shadow so the click affordance is obvious
 function AppCard({
   app: a,
   busy,
@@ -149,22 +198,52 @@ function AppCard({
   busy: boolean;
   onDelete: () => void;
 }) {
+  const status = a.latest_status?.status ?? null;
   return (
-    <div className="flex flex-col rounded-lg border border-border bg-background p-4 transition-colors hover:bg-muted/30">
-      <Link to={`/apps/${a.id}`} className="flex min-w-0 flex-1 flex-col">
+    // The outer wrapper is the visual card (border + accent + shadow).
+    // The Link is the clickable body. The Delete button is its own
+    // element in the footer.
+    <div
+      className={cn(
+        "group flex flex-col overflow-hidden rounded-lg border border-border bg-background shadow-sm transition-all",
+        "hover:border-foreground/20 hover:shadow-md",
+      )}
+    >
+      {/* Status accent bar. The 4px height is enough to read at a
+          glance without eating into the card's vertical space. */}
+      <div className={cn("h-1 w-full", statusAccent(status))} aria-hidden="true" />
+
+      <Link
+        to={`/apps/${a.id}`}
+        className="flex min-w-0 flex-1 flex-col p-4 transition-colors hover:bg-muted/30"
+      >
         <div className="flex min-w-0 items-start justify-between gap-2">
-          <h3 className="truncate font-medium">{a.name}</h3>
+          <h3 className="truncate font-medium" title={a.name}>
+            {a.name}
+          </h3>
           <span className="shrink-0 font-mono text-xs text-muted-foreground">v{a.version}</span>
         </div>
-        <p className="mt-1 break-all text-xs text-muted-foreground">{a.repository_url}</p>
-        <dl className="mt-3 flex items-center gap-4 text-xs text-muted-foreground">
-          <div>
-            <dt className="inline">Port: </dt>
-            <dd className="inline font-mono">{a.container_port}</dd>
-          </div>
+        <p className="mt-1 truncate text-xs text-muted-foreground" title={a.repository_url}>
+          {a.repository_url}
+        </p>
+
+        <div className="mt-3 flex items-center gap-2">
+          {status ? (
+            <Badge variant={statusBadgeVariant(status)}>{status.toLowerCase()}</Badge>
+          ) : (
+            <Badge variant="outline">never deployed</Badge>
+          )}
+        </div>
+
+        <dl className="mt-3 grid grid-cols-2 gap-y-1 text-xs text-muted-foreground">
+          <dt>Namespace</dt>
+          <dd className="truncate text-right font-mono">{a.latest_status?.namespace ?? "—"}</dd>
+          <dt>Port</dt>
+          <dd className="text-right font-mono">{a.container_port}</dd>
         </dl>
       </Link>
-      <div className="mt-3 flex items-center justify-end border-t border-border pt-3">
+
+      <div className="flex items-center justify-end border-t border-border px-4 py-2">
         <Button
           size="sm"
           variant="ghost"
