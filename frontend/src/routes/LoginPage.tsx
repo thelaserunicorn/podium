@@ -39,7 +39,14 @@ export function LoginPage() {
   }
 
   return (
-    <div className="flex min-h-screen items-center justify-center bg-muted p-4">
+    <div className="flex min-h-screen flex-col items-center justify-center gap-6 bg-muted p-4">
+      {/*
+        Brand mark above the auth card. `max-w-sm` matches the Card's
+        width so the logo's right edge aligns with the form's right
+        edge; the wide ~3.7:1 PNG renders best at ~h-10. Served by Vite
+        from frontend/public/.
+      */}
+      <img src="/logo.png" alt="Podium" className="h-10 w-auto max-w-sm object-contain" />
       <Card className="w-full max-w-sm">
         <CardHeader>
           <CardTitle>Sign in to Podium</CardTitle>

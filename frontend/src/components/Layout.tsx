@@ -10,8 +10,15 @@ export function Layout() {
   return (
     <div className="flex min-h-screen bg-muted">
       <aside className="hidden w-56 shrink-0 border-r border-border bg-background md:flex md:flex-col">
-        <div className="flex h-14 items-center border-b border-border px-4 text-sm font-semibold">
-          Podium
+        {/*
+          Sidebar brand. `h-8` keeps the wide logo comfortably inside the
+          56px header row with vertical padding on either side; the
+          `px-4` horizontal padding matches the nav links below so the
+          logo's left edge lines up with the icon column. Served by Vite
+          from frontend/public/.
+        */}
+        <div className="flex h-14 items-center border-b border-border px-4">
+          <img src="/logo.png" alt="Podium" className="h-8 w-auto" />
         </div>
         <nav className="flex flex-col gap-1 p-3">
           <SidebarLink to="/dashboard" icon={<LayoutDashboard className="h-4 w-4" />}>
