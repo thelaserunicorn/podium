@@ -668,6 +668,72 @@ func (q *Queries) LatestSuccessfulDeployment(ctx context.Context, appID, envID, 
 	return d, nil
 }
 
+// CountDeploymentsByEnv returns the number of deployment rows that
+// reference envID. Used by the namespaces page to surface usage to the
+// admin before they hit Delete. Counts every row regardless of status
+// (QUEUED / FAILED / RUNNING alike) and includes the soft-deleted ones
+// — the value tells the admin "how much history will be wiped", which
+// is the right question for a destructive action.
+func (q *Queries) CountDeploymentsByEnv(ctx context.Context, envID int64) (int64, error) {
+	if q == nil || q.db == nil {
+		return 0, errors.New("storage: queries not initialised")
+	}
+	var n int64
+	if err := q.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM deployments WHERE environment_id = ?`, envID).Scan(&n); err != nil {
+		return 0, fmt.Errorf("storage: count deployments by env: %w", err)
+	}
+	return n, nil
+}
+
+// DeleteDeploymentsByEnv removes every deployment row that references
+// envID. The deploy_log_lines child rows cascade away via the existing
+// ON DELETE CASCADE on deploy_log_lines.deployment_id
+// (migrations/0001_init.sql). Returns the number of deployment rows
+// removed so the caller can log it. environment_variables rows for the
+// namespace are NOT touched here — those cascade via DeleteEnvironment.
+func (q *Queries) DeleteDeploymentsByEnv(ctx context.Context, envID int64) (int64, error) {
+	if q == nil || q.db == nil {
+		return 0, errors.New("storage: queries not initialised")
+	}
+	res, err := q.db.ExecContext(ctx,
+		`DELETE FROM deployments WHERE environment_id = ?`, envID)
+	if err != nil {
+		return 0, fmt.Errorf("storage: delete deployments by env: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return 0, fmt.Errorf("storage: rows affected: %w", err)
+	}
+	return n, nil
+}
+
+// DeleteEnvironment removes the row with the given id. environment_variables
+// for this environment cascade away via the FK ON DELETE CASCADE declared
+// in migrations/0001_init.sql. The caller is responsible for cleaning up
+// deployments referencing this environment first (use
+// DeleteDeploymentsByEnv) — the deployments.environment_id FK does not
+// have ON DELETE CASCADE because deleting a deployment is a meaningful
+// operation that goes through orchestrator bookkeeping. Returns
+// sql.ErrNoRows if the id does not exist.
+func (q *Queries) DeleteEnvironment(ctx context.Context, id int64) error {
+	if q == nil || q.db == nil {
+		return errors.New("storage: queries not initialised")
+	}
+	res, err := q.db.ExecContext(ctx, `DELETE FROM environments WHERE id = ?`, id)
+	if err != nil {
+		return fmt.Errorf("storage: delete environment: %w", err)
+	}
+	n, err := res.RowsAffected()
+	if err != nil {
+		return fmt.Errorf("storage: rows affected: %w", err)
+	}
+	if n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
+}
+
 // DeploymentAtVersion returns the deployment for (appID, envID, version)
 // or sql.ErrNoRows if no such row exists. Used by Rollback to look up
 // the exact target image when the user picks a specific prior version.

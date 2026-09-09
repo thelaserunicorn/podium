@@ -442,3 +442,106 @@ func TestLatestDeploymentStatuses_CrossNamespace(t *testing.T) {
 }
 
 func zeroTime() (t sql.NullTime) { return }
+
+// TestCountDeploymentsByEnv: a freshly seeded app has zero deployments in
+// any environment; inserting two bumps the count. Counts are global
+// across users because namespaces are global (DECISIONS.md C).
+func TestCountDeploymentsByEnv(t *testing.T) {
+	q := newTestQueries(t)
+	ctx := context.Background()
+	_, appID, envID := seedUserAppEnv(t, q)
+
+	got, err := q.CountDeploymentsByEnv(ctx, envID)
+	if err != nil {
+		t.Fatalf("CountDeploymentsByEnv (empty): %v", err)
+	}
+	if got != 0 {
+		t.Errorf("empty count: got %d want 0", got)
+	}
+
+	if _, err := q.CreateDeployment(ctx, appID, envID, 1, 1, "a:v1"); err != nil {
+		t.Fatalf("CreateDeployment 1: %v", err)
+	}
+	if _, err := q.CreateDeployment(ctx, appID, envID, 2, 1, "a:v2"); err != nil {
+		t.Fatalf("CreateDeployment 2: %v", err)
+	}
+
+	got, err = q.CountDeploymentsByEnv(ctx, envID)
+	if err != nil {
+		t.Fatalf("CountDeploymentsByEnv (after inserts): %v", err)
+	}
+	if got != 2 {
+		t.Errorf("after two inserts: got %d want 2", got)
+	}
+}
+
+// TestDeleteDeploymentsByEnv: bulk delete removes every row referencing
+// the environment and returns the count.
+func TestDeleteDeploymentsByEnv(t *testing.T) {
+	q := newTestQueries(t)
+	ctx := context.Background()
+	_, appID, envID := seedUserAppEnv(t, q)
+
+	for i := 1; i <= 3; i++ {
+		if _, err := q.CreateDeployment(ctx, appID, envID, i, 1, fmt.Sprintf("a:v%d", i)); err != nil {
+			t.Fatalf("CreateDeployment %d: %v", i, err)
+		}
+	}
+
+	n, err := q.DeleteDeploymentsByEnv(ctx, envID)
+	if err != nil {
+		t.Fatalf("DeleteDeploymentsByEnv: %v", err)
+	}
+	if n != 3 {
+		t.Errorf("rows removed: got %d want 3", n)
+	}
+	remaining, _ := q.CountDeploymentsByEnv(ctx, envID)
+	if remaining != 0 {
+		t.Errorf("after bulk delete: got %d want 0", remaining)
+	}
+}
+
+// TestDeleteEnvironment_CascadesEnvVars: env vars pointing at this
+// environment_id are removed via the FK cascade declared in
+// migrations/0001_init.sql line 78. Deployments are NOT cascaded by
+// this FK (no ON DELETE CASCADE on deployments.environment_id), so
+// the caller must run DeleteDeploymentsByEnv first.
+func TestDeleteEnvironment_CascadesEnvVars(t *testing.T) {
+	q := newTestQueries(t)
+	ctx := context.Background()
+	_, appID, envID := seedUserAppEnv(t, q)
+
+	if _, err := q.db.ExecContext(ctx,
+		`INSERT INTO environment_variables (application_id, environment_id, key, value, is_secret) VALUES (?, ?, ?, ?, 0)`,
+		appID, envID, "FOO", "bar"); err != nil {
+		t.Fatalf("seed env var: %v", err)
+	}
+
+	if err := q.DeleteEnvironment(ctx, envID); err != nil {
+		t.Fatalf("DeleteEnvironment: %v", err)
+	}
+
+	var remaining int
+	if err := q.db.QueryRowContext(ctx,
+		`SELECT COUNT(*) FROM environment_variables WHERE environment_id = ?`, envID).Scan(&remaining); err != nil {
+		t.Fatalf("count env vars: %v", err)
+	}
+	if remaining != 0 {
+		t.Errorf("env vars after cascade: got %d want 0", remaining)
+	}
+}
+
+// TestDeleteEnvironment_UnknownID: deleting a non-existent id returns
+// sql.ErrNoRows so the HTTP layer can map it to 404.
+func TestDeleteEnvironment_UnknownID(t *testing.T) {
+	q := newTestQueries(t)
+	ctx := context.Background()
+
+	err := q.DeleteEnvironment(ctx, 99999)
+	if err == nil {
+		t.Fatal("expected error, got nil")
+	}
+	if !errors.Is(err, sql.ErrNoRows) {
+		t.Errorf("expected sql.ErrNoRows, got %v", err)
+	}
+}
