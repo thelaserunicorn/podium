@@ -60,7 +60,15 @@ export function AppDetailPage() {
   const [app, setApp] = useState<Application | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [namespaces, setNamespaces] = useState<NamespaceRow[]>([]);
+  // The namespace currently scoped on this page. Always holds a real
+  // DNS-1123 string — never the "__custom__" sentinel. The free-text
+  // input for custom namespaces is a separate piece of state below.
   const [namespace, setNamespace] = useState<string>("podium-dev");
+  // When true, the picker shows "Other…" and a free-text input appears.
+  // The actual namespace value being used is customNamespace.trim(),
+  // folded into effectiveNamespace and threaded through to every child.
+  const [useCustom, setUseCustom] = useState(false);
+  const [customNamespace, setCustomNamespace] = useState("");
   const [tab, setTab] = useState<"overview" | "deployments" | "logs" | "events" | "env">(
     "overview",
   );
@@ -105,12 +113,21 @@ export function AppDetailPage() {
     })();
   }, []);
 
-  // Reset the lifted pods whenever the user switches namespace so
-  // we don't render stale rows from the previous namespace during
-  // the ~5s window before K8sOverview's next poll lands.
+  // The namespace actually in use for fetches. When the user picks
+  // "Other…" we resolve it to the trimmed customNamespace (or "" if
+  // the user hasn't typed yet — children that issue fetches will just
+  // get an empty namespace and the backend will 400, which is honest).
+  const effectiveNamespace = useMemo(
+    () => (useCustom ? customNamespace.trim() : namespace),
+    [useCustom, customNamespace, namespace],
+  );
+
+  // Reset the lifted pods whenever the scoped namespace changes so we
+  // don't render stale rows from the previous namespace during the ~5s
+  // window before K8sOverview's next poll lands.
   useEffect(() => {
     setPods([]);
-  }, [namespace]);
+  }, [effectiveNamespace]);
 
   if (error) {
     return (
@@ -165,8 +182,16 @@ export function AppDetailPage() {
             <Label htmlFor="ns-picker">Namespace:</Label>
             <select
               id="ns-picker"
-              value={namespace}
-              onChange={(e) => setNamespace(e.target.value)}
+              value={useCustom ? "__custom__" : namespace}
+              onChange={(e) => {
+                const v = e.target.value;
+                if (v === "__custom__") {
+                  setUseCustom(true);
+                } else {
+                  setUseCustom(false);
+                  setNamespace(v);
+                }
+              }}
               className="rounded-md border border-border bg-background px-2 py-1 font-mono text-xs"
             >
               {namespaces.map((n) => (
@@ -176,6 +201,14 @@ export function AppDetailPage() {
               ))}
               <option value="__custom__">Other…</option>
             </select>
+            {useCustom && (
+              <Input
+                placeholder="custom-namespace"
+                value={customNamespace}
+                onChange={(e) => setCustomNamespace(e.target.value)}
+                className="h-7 w-44 font-mono text-xs"
+              />
+            )}
           </div>
           <Badge variant="secondary">v{app.version}</Badge>
           <Button
@@ -221,7 +254,7 @@ export function AppDetailPage() {
 
       {tab === "overview" && (
         <div className="space-y-4">
-          <AppUrlCardWithState appId={app.id} namespace={namespace} />
+          <AppUrlCardWithState appId={app.id} namespace={effectiveNamespace} />
           <div className="grid grid-cols-1 gap-4 md:grid-cols-3">
             <Card>
               <CardHeader>
@@ -232,7 +265,11 @@ export function AppDetailPage() {
                 <Row label="Created" value={new Date(app.created_at).toLocaleString()} />
                 <Row label="Updated" value={new Date(app.updated_at).toLocaleString()} />
                 <div className="border-t border-border pt-3">
-                  <K8sOverview appId={app.id} namespace={namespace} onPodsChange={setPods} />
+                  <K8sOverview
+                    appId={app.id}
+                    namespace={effectiveNamespace}
+                    onPodsChange={setPods}
+                  />
                 </div>
               </CardContent>
             </Card>
@@ -244,7 +281,7 @@ export function AppDetailPage() {
                 </CardTitle>
               </CardHeader>
               <CardContent>
-                <RecentActivityCard namespace={namespace} pods={pods} />
+                <RecentActivityCard namespace={effectiveNamespace} pods={pods} />
               </CardContent>
             </Card>
           </div>
@@ -259,7 +296,10 @@ export function AppDetailPage() {
           <CardContent>
             <DeploymentsTab
               appId={app.id}
-              namespace={namespace}
+              namespace={effectiveNamespace}
+              useCustom={useCustom}
+              customNamespace={customNamespace}
+              onCustomNamespaceChange={setCustomNamespace}
               onSelect={(d) => setLatestDeploymentID(d.id)}
             />
           </CardContent>
@@ -272,7 +312,7 @@ export function AppDetailPage() {
             <CardTitle>Logs</CardTitle>
           </CardHeader>
           <CardContent>
-            <AppLogsTab appId={app.id} namespace={namespace} />
+            <AppLogsTab appId={app.id} namespace={effectiveNamespace} />
           </CardContent>
         </Card>
       )}
@@ -283,7 +323,7 @@ export function AppDetailPage() {
             <CardTitle>Events</CardTitle>
           </CardHeader>
           <CardContent>
-            <AppEventsTab namespace={namespace} deploymentId={latestDeploymentID} />
+            <AppEventsTab namespace={effectiveNamespace} deploymentId={latestDeploymentID} />
           </CardContent>
         </Card>
       )}
@@ -294,7 +334,7 @@ export function AppDetailPage() {
             <CardTitle>Environment variables</CardTitle>
           </CardHeader>
           <CardContent>
-            <EnvVarsPanel appId={app.id} namespace={namespace} />
+            <EnvVarsPanel appId={app.id} namespace={effectiveNamespace} />
           </CardContent>
         </Card>
       )}
@@ -329,10 +369,21 @@ function Row({ label, value }: { label: string; value: string }) {
 function DeploymentsTab({
   appId,
   namespace,
+  useCustom,
+  customNamespace,
+  onCustomNamespaceChange,
   onSelect,
 }: {
   appId: number;
+  // The *effective* namespace — the parent's resolved value (already
+  // folded from customNamespace when useCustom is true). We just
+  // forward it to the backend in deploy() / load().
   namespace: string;
+  // Whether the user picked "Other…" — used to render the free-text
+  // input next to the deploy button.
+  useCustom: boolean;
+  customNamespace: string;
+  onCustomNamespaceChange: (v: string) => void;
   // Notified whenever the user picks a row — the parent uses this
   // to drive the Events tab's deploymentId so events get scoped to
   // the user's chosen attempt.
@@ -344,7 +395,6 @@ function DeploymentsTab({
   const [selected, setSelected] = useState<Deployment | null>(null);
   // Replicas control lives inside the deploy button (1..5 default 3).
   const [replicas, setReplicas] = useState(3);
-  const [customNs, setCustomNs] = useState("");
   // Shared confirm state for rollback + delete-deployment (two
   // destructive actions that both surface from the row menu). Same
   // single-state pattern as the top-level delete-app confirm.
@@ -354,11 +404,6 @@ function DeploymentsTab({
     confirmLabel: string;
     run: () => Promise<void>;
   } | null>(null);
-  const showCustomInput = namespace === "__custom__";
-  const effectiveNamespace = useMemo(
-    () => (showCustomInput ? customNs.trim() : namespace),
-    [showCustomInput, customNs, namespace],
-  );
 
   const load = useCallback(async () => {
     try {
@@ -376,16 +421,15 @@ function DeploymentsTab({
   }, [load]);
 
   async function deploy() {
-    if (!effectiveNamespace) {
-      setError("Namespace is required");
+    if (!namespace) {
+      setError(
+        useCustom ? "Type a namespace name or pick one from the list" : "Namespace is required",
+      );
       return;
     }
     // Client-side DNS-1123 sanity check so the user sees the error
     // before the request leaves the browser.
-    if (
-      !/^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(effectiveNamespace) ||
-      effectiveNamespace.length > 63
-    ) {
+    if (!/^[a-z0-9]([-a-z0-9]*[a-z0-9])?$/.test(namespace) || namespace.length > 63) {
       setError("Namespace must be DNS-1123 (lowercase, digits, dashes; 1..63 chars).");
       return;
     }
@@ -393,7 +437,7 @@ function DeploymentsTab({
     setError(null);
     try {
       const res = await api.post<{ deployment: Deployment }>(`/api/applications/${appId}/deploy`, {
-        namespace: effectiveNamespace,
+        namespace,
         replicas,
       });
       await load();
@@ -472,11 +516,11 @@ function DeploymentsTab({
           Each deployment builds a Docker image and rolls it out to the selected namespace.
         </p>
         <div className="flex items-center gap-2">
-          {showCustomInput && (
+          {useCustom && (
             <Input
               placeholder="custom-namespace"
-              value={customNs}
-              onChange={(e) => setCustomNs(e.target.value)}
+              value={customNamespace}
+              onChange={(e) => onCustomNamespaceChange(e.target.value)}
               className="h-8 w-44 font-mono text-xs"
             />
           )}
