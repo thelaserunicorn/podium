@@ -12,6 +12,7 @@ import { EnvVarsPanel } from "@/components/EnvVarsPanel";
 import { AppLogsTab } from "@/components/AppLogsTab";
 import { AppEventsTab } from "@/components/AppEventsTab";
 import { AppUrlCard } from "@/components/AppUrlCard";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
 
 interface Application {
   id: number;
@@ -66,6 +67,13 @@ export function AppDetailPage() {
   // view to this deployment; the Deployments tab updates it whenever
   // the user picks a row in the history list.
   const [latestDeploymentID, setLatestDeploymentID] = useState<number | null>(null);
+  // Pending destructive-action confirm for the top-right "Delete"
+  // button. Rollback / delete-deployment live inside DeploymentsTab
+  // and use their own confirm state below.
+  const [confirmDelete, setConfirmDelete] = useState<{
+    description: string;
+    run: () => Promise<void>;
+  } | null>(null);
 
   useEffect(() => {
     if (!id) return;
@@ -107,27 +115,36 @@ export function AppDetailPage() {
   const a: Application = app;
 
   async function deleteApp() {
-    if (
-      !window.confirm(
-        `Delete application "${a.name}"? All deployments and Kubernetes resources will be torn down.`,
-      )
-    ) {
-      return;
-    }
-    try {
-      await api.del<void>(`/api/applications/${a.id}`);
-      navigate("/apps");
-    } catch (e) {
-      setError((e as Error).message);
-    }
+    // Open the destructive-confirm modal. The actual API call +
+    // navigation live in the modal's onConfirm, so the dialog can
+    // close immediately on the user's deliberate click (vs. waiting
+    // for the DELETE to round-trip + reload).
+    setConfirmDelete({
+      description: `Delete application "${a.name}"? All deployments and Kubernetes resources will be torn down.`,
+      run: async () => {
+        try {
+          await api.del<void>(`/api/applications/${a.id}`);
+          navigate("/apps");
+        } catch (e) {
+          setError((e as Error).message);
+        }
+      },
+    });
   }
 
   return (
     <div className="space-y-6">
-      <div className="flex items-center justify-between">
-        <div>
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="min-w-0 flex-1">
           <h1 className="text-2xl font-semibold">{app.name}</h1>
-          <p className="text-sm text-muted-foreground">{app.repository_url}</p>
+          {/*
+            break-all + min-w-0 so a long repo URL can't push the page
+            header wider than its column. Combined with flex-wrap on
+            the parent, this also lets the namespace picker / delete
+            button wrap to a new line on narrow viewports instead of
+            clipping.
+          */}
+          <p className="break-all text-sm text-muted-foreground">{app.repository_url}</p>
         </div>
         <div className="flex items-center gap-3">
           <div className="flex items-center gap-2 text-xs text-muted-foreground">
@@ -264,6 +281,21 @@ export function AppDetailPage() {
           </CardContent>
         </Card>
       )}
+
+      <ConfirmDialog
+        open={!!confirmDelete}
+        onOpenChange={(o) => {
+          if (!o) setConfirmDelete(null);
+        }}
+        title="Delete application?"
+        description={confirmDelete?.description ?? ""}
+        confirmLabel="Delete"
+        onConfirm={() => {
+          const run = confirmDelete?.run;
+          setConfirmDelete(null);
+          if (run) void run();
+        }}
+      />
     </div>
   );
 }
@@ -296,6 +328,15 @@ function DeploymentsTab({
   // Replicas control lives inside the deploy button (1..5 default 3).
   const [replicas, setReplicas] = useState(3);
   const [customNs, setCustomNs] = useState("");
+  // Shared confirm state for rollback + delete-deployment (two
+  // destructive actions that both surface from the row menu). Same
+  // single-state pattern as the top-level delete-app confirm.
+  const [confirm, setConfirm] = useState<{
+    title: string;
+    description: string;
+    confirmLabel: string;
+    run: () => Promise<void>;
+  } | null>(null);
   const showCustomInput = namespace === "__custom__";
   const effectiveNamespace = useMemo(
     () => (showCustomInput ? customNs.trim() : namespace),
@@ -349,31 +390,32 @@ function DeploymentsTab({
   }
 
   async function rollback(d: Deployment) {
-    // Two-click confirmation inline keeps the action discoverable but
-    // protects against accidental clicks. window.confirm is overkill
-    // for an MVP rollback — the row state does that for us.
-    if (
-      !window.confirm(
-        `Roll back to v${d.version} (${d.image})? A new deployment will be created in ${namespace}.`,
-      )
-    ) {
-      return;
-    }
-    setBusy(true);
-    setError(null);
-    try {
-      const res = await api.post<{ deployment: Deployment }>(
-        `/api/deployments/${d.id}/rollback`,
-        {},
-      );
-      await load();
-      setSelected(res.deployment);
-      onSelect?.(res.deployment);
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setBusy(false);
-    }
+    // Rollback creates a brand-new deployment whose image is pinned
+    // to the previous successful version — it doesn't rebuild
+    // anything. Confirm because the user can't easily undo it (they'd
+    // need to roll forward to a newer image, if one exists).
+    setConfirm({
+      title: `Roll back to v${d.version}?`,
+      description: `Roll back to v${d.version} (${d.image})? A new deployment will be created in ${namespace}.`,
+      confirmLabel: "Roll back",
+      run: async () => {
+        setBusy(true);
+        setError(null);
+        try {
+          const res = await api.post<{ deployment: Deployment }>(
+            `/api/deployments/${d.id}/rollback`,
+            {},
+          );
+          await load();
+          setSelected(res.deployment);
+          onSelect?.(res.deployment);
+        } catch (e) {
+          setError((e as Error).message);
+        } finally {
+          setBusy(false);
+        }
+      },
+    });
   }
 
   async function deleteDeployment(d: Deployment) {
@@ -382,28 +424,28 @@ function DeploymentsTab({
     // backend/internal/application/deployment_delete.go). Confirm
     // because the user cannot undo this — once it's gone, the live
     // pods are gone too.
-    if (
-      !window.confirm(
-        `Delete deployment #${d.id} (${d.image})? The live app in ${namespace} will be torn down.`,
-      )
-    ) {
-      return;
-    }
-    setBusy(true);
-    setError(null);
-    try {
-      await api.del<void>(`/api/deployments/${d.id}`);
-      // Clear the build-log viewer if the user just deleted the row
-      // it was showing.
-      if (selected && selected.id === d.id) {
-        setSelected(null);
-      }
-      await load();
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setBusy(false);
-    }
+    setConfirm({
+      title: "Delete deployment?",
+      description: `Delete deployment #${d.id} (${d.image})? The live app in ${namespace} will be torn down.`,
+      confirmLabel: "Delete",
+      run: async () => {
+        setBusy(true);
+        setError(null);
+        try {
+          await api.del<void>(`/api/deployments/${d.id}`);
+          // Clear the build-log viewer if the user just deleted the
+          // row it was showing.
+          if (selected && selected.id === d.id) {
+            setSelected(null);
+          }
+          await load();
+        } catch (e) {
+          setError((e as Error).message);
+        } finally {
+          setBusy(false);
+        }
+      },
+    });
   }
 
   return (
@@ -455,17 +497,23 @@ function DeploymentsTab({
             {deployments.map((d) => (
               <li
                 key={d.id}
-                className="flex cursor-pointer items-center justify-between px-3 py-2 text-sm hover:bg-muted/50"
+                // min-w-0 lets this flex row shrink below its
+                // intrinsic content size so a long image string in
+                // the inner span can't push the row wider than the
+                // card.
+                className="flex min-w-0 cursor-pointer items-center justify-between gap-3 px-3 py-2 text-sm hover:bg-muted/50"
                 onClick={() => {
                   setSelected(d);
                   onSelect?.(d);
                 }}
               >
-                <div className="flex items-center gap-3">
-                  <span className="font-mono text-xs">#{d.id}</span>
-                  <span className="font-mono text-xs text-muted-foreground">{d.image}</span>
+                <div className="flex min-w-0 items-center gap-3">
+                  <span className="shrink-0 font-mono text-xs">#{d.id}</span>
+                  <span className="truncate font-mono text-xs text-muted-foreground">
+                    {d.image}
+                  </span>
                 </div>
-                <div className="flex items-center gap-3">
+                <div className="flex shrink-0 items-center gap-3">
                   <span className="text-xs text-muted-foreground">
                     {new Date(d.created_at).toLocaleString()}
                   </span>
@@ -506,6 +554,21 @@ function DeploymentsTab({
           {selected && <BuildLogViewer deployment={selected} onClose={() => setSelected(null)} />}
         </div>
       )}
+
+      <ConfirmDialog
+        open={!!confirm}
+        onOpenChange={(o) => {
+          if (!o) setConfirm(null);
+        }}
+        title={confirm?.title ?? ""}
+        description={confirm?.description ?? ""}
+        confirmLabel={confirm?.confirmLabel}
+        onConfirm={() => {
+          const run = confirm?.run;
+          setConfirm(null);
+          if (run) void run();
+        }}
+      />
     </div>
   );
 }
@@ -592,13 +655,23 @@ function BuildLogViewer({ deployment, onClose }: { deployment: Deployment; onClo
       {error && <p className="text-xs text-destructive">{error}</p>}
       <div
         ref={scrollerRef}
-        className="max-h-80 overflow-y-auto rounded bg-background p-3 font-mono text-xs leading-relaxed"
+        // overflow-auto (both axes) keeps long build-log lines inside the
+        // viewer instead of stretching the page horizontally. Each line
+        // already has whitespace-pre-wrap, so once width is bounded the
+        // text wraps; truly unbreakable strings still get an in-box
+        // horizontal scrollbar rather than pushing the page.
+        className="max-h-80 overflow-auto rounded bg-background p-3 font-mono text-xs leading-relaxed"
       >
         {lines.length === 0 ? (
           <p className="text-muted-foreground">Waiting for build output…</p>
         ) : (
           lines.map((l, i) => (
-            <div key={`${l.ts}-${i}`} className="whitespace-pre-wrap">
+            // `break-all` (not `whitespace-pre-wrap`) so unbreakable
+            // strings — BuildKit's moby.buildkit.trace aux lines are
+            // wall-to-wall JSON with no whitespace — wrap at any
+            // character. `whitespace-pre-wrap` alone would leave them
+            // on a single line wider than the scroller.
+            <div key={`${l.ts}-${i}`} className="break-all">
               <span className="mr-2 text-muted-foreground">
                 {new Date(l.ts).toLocaleTimeString()}
               </span>

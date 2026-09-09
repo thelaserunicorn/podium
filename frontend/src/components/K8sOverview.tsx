@@ -2,6 +2,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { api } from "@/lib/api";
 import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
 
 // PodSummary mirrors backend/internal/kubernetes.PodSummary.
 export interface PodSummary {
@@ -55,6 +56,12 @@ export function K8sOverview({ appId, namespace }: K8sOverviewProps) {
   const [desired, setDesired] = useState<number | null>(null);
   const [busy, setBusy] = useState(false);
   const [actionError, setActionError] = useState<string | null>(null);
+  // Pending restart confirmation. Same single-state shape as the
+  // confirms in AppListPage / AppDetailPage — null means no modal.
+  const [confirmRestart, setConfirmRestart] = useState<{
+    description: string;
+    run: () => Promise<void>;
+  } | null>(null);
 
   const tick = useCallback(async () => {
     try {
@@ -139,18 +146,26 @@ export function K8sOverview({ appId, namespace }: K8sOverviewProps) {
     }
   };
 
-  const restart = async () => {
-    if (!window.confirm("Restart the application? Pods will be deleted and recreated.")) return;
-    setBusy(true);
-    setActionError(null);
-    try {
-      await api.post(`/api/applications/${appId}/restart`, { namespace });
-      await tick();
-    } catch (e) {
-      setActionError((e as Error).message);
-    } finally {
-      setBusy(false);
-    }
+  const restart = () => {
+    // Restart tears down every pod and lets the Deployment recreate
+    // them — there is a brief window where the app is unreachable.
+    // Confirm so the user doesn't trigger this accidentally while
+    // the Restart button sits next to Scale.
+    setConfirmRestart({
+      description: "Restart the application? Pods will be deleted and recreated.",
+      run: async () => {
+        setBusy(true);
+        setActionError(null);
+        try {
+          await api.post(`/api/applications/${appId}/restart`, { namespace });
+          await tick();
+        } catch (e) {
+          setActionError((e as Error).message);
+        } finally {
+          setBusy(false);
+        }
+      },
+    });
   };
 
   if (error && !state) {
@@ -215,7 +230,7 @@ export function K8sOverview({ appId, namespace }: K8sOverviewProps) {
         >
           {busy ? "Scaling…" : "Scale"}
         </Button>
-        <Button size="sm" variant="outline" disabled={busy} onClick={() => void restart()}>
+        <Button size="sm" variant="outline" disabled={busy} onClick={() => restart()}>
           {busy ? "Restarting…" : "Restart"}
         </Button>
         {actionError && <span className="text-xs text-destructive">{actionError}</span>}
@@ -253,6 +268,21 @@ export function K8sOverview({ appId, namespace }: K8sOverviewProps) {
           </table>
         </div>
       )}
+
+      <ConfirmDialog
+        open={!!confirmRestart}
+        onOpenChange={(o) => {
+          if (!o) setConfirmRestart(null);
+        }}
+        title="Restart application?"
+        description={confirmRestart?.description ?? ""}
+        confirmLabel="Restart"
+        onConfirm={() => {
+          const run = confirmRestart?.run;
+          setConfirmRestart(null);
+          if (run) void run();
+        }}
+      />
     </div>
   );
 }

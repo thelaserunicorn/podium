@@ -108,26 +108,43 @@ export function DashboardPage() {
             </div>
           )}
           {apps && apps.length > 0 && (
-            <ul className="divide-y divide-border">
+            <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
               {apps.map((a) => (
-                <li key={a.id} className="flex items-center justify-between py-3">
-                  <div className="flex items-center gap-2">
-                    <Link to={`/apps/${a.id}`} className="text-sm font-medium hover:underline">
-                      {a.name}
-                    </Link>
-                    {a.latest_status && <StatusBadge status={a.latest_status.status} />}
-                  </div>
-                  <div className="flex items-center gap-3 text-xs text-muted-foreground">
-                    {a.latest_status?.namespace && <span>{a.latest_status.namespace}</span>}
-                    <span>v{a.version}</span>
-                  </div>
-                </li>
+                <AppCard key={a.id} app={a} />
               ))}
-            </ul>
+            </div>
           )}
         </CardContent>
       </Card>
     </div>
+  );
+}
+
+// AppCard — one application in the dashboard grid. The card itself
+// is a Card primitive; clicking anywhere on it navigates to the
+// detail page (matches the "click a row" affordance the old list
+// provided). No destructive action here — Dashboard is read-only.
+function AppCard({ app: a }: { app: Application }) {
+  const status = a.latest_status?.status ?? null;
+  const namespace = a.latest_status?.namespace ?? null;
+  return (
+    <Link
+      to={`/apps/${a.id}`}
+      className="block rounded-lg border border-border bg-background p-4 transition-colors hover:bg-muted/50"
+    >
+      <div className="flex min-w-0 items-start justify-between gap-2">
+        <h3 className="truncate font-medium">{a.name}</h3>
+        {status && <StatusBadge status={status} />}
+      </div>
+      <dl className="mt-3 grid grid-cols-2 gap-y-1 text-xs text-muted-foreground">
+        <dt>Version</dt>
+        <dd className="text-right font-mono">v{a.version}</dd>
+        <dt>Namespace</dt>
+        <dd className="truncate text-right font-mono">{namespace ?? "—"}</dd>
+        <dt>Port</dt>
+        <dd className="text-right font-mono">{a.container_port}</dd>
+      </dl>
+    </Link>
   );
 }
 

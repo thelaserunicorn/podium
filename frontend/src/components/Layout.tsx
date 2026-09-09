@@ -1,5 +1,5 @@
 import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
-import { LayoutDashboard, Layers, ShieldCheck, LogOut } from "lucide-react";
+import { LayoutDashboard, Layers, ShieldCheck, LogOut, FileCode2 } from "lucide-react";
 import { useAuth } from "@/lib/auth";
 import { Button } from "@/components/ui/button";
 
@@ -19,6 +19,9 @@ export function Layout() {
           </SidebarLink>
           <SidebarLink to="/apps" icon={<Layers className="h-4 w-4" />}>
             Applications
+          </SidebarLink>
+          <SidebarLink to="/yaml-generator" icon={<FileCode2 className="h-4 w-4" />}>
+            YAML generator
           </SidebarLink>
           {user?.role === "ADMIN" && (
             <SidebarLink to="/admin/users" icon={<ShieldCheck className="h-4 w-4" />}>
@@ -81,6 +84,8 @@ function SidebarLink({
 
 function labelFor(pathname: string): React.ReactNode {
   if (pathname.startsWith("/admin")) return <Link to="/admin/users">Admin · Users</Link>;
+  if (pathname.startsWith("/yaml-generator"))
+    return <Link to="/yaml-generator">YAML generator</Link>;
   if (pathname.startsWith("/apps/new")) return <Link to="/apps/new">New application</Link>;
   if (pathname.startsWith("/apps/")) return <Link to="/apps">Applications</Link>;
   if (pathname.startsWith("/apps")) return <Link to="/apps">Applications</Link>;

@@ -13,6 +13,7 @@ import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { Badge } from "@/components/ui/badge";
+import { ConfirmDialog } from "@/components/ConfirmDialog";
 
 interface EnvVar {
   id: number;
@@ -33,6 +34,12 @@ export function EnvVarsPanel({ appId, namespace }: { appId: number; namespace: s
   const [newIsSecret, setNewIsSecret] = useState(false);
   const [busy, setBusy] = useState(false);
   const [revealedSecrets, setRevealedSecrets] = useState<Set<number>>(new Set());
+  // Pending delete confirmation — the closure captures the specific
+  // key the user clicked so the modal can describe it precisely.
+  const [confirmDelete, setConfirmDelete] = useState<{
+    description: string;
+    run: () => Promise<void>;
+  } | null>(null);
 
   const load = useCallback(async () => {
     setError(null);
@@ -88,21 +95,24 @@ export function EnvVarsPanel({ appId, namespace }: { appId: number; namespace: s
     }
   }
 
-  async function deleteVar(key: string) {
-    if (!window.confirm(`Delete env var "${key}"? This clears it from the ConfigMap/Secret too.`))
-      return;
-    setBusy(true);
-    setError(null);
-    try {
-      await api.del(
-        `/api/applications/${appId}/env/${encodeURIComponent(key)}?namespace=${encodeURIComponent(namespace)}`,
-      );
-      await load();
-    } catch (e) {
-      setError((e as Error).message);
-    } finally {
-      setBusy(false);
-    }
+  function deleteVar(key: string) {
+    setConfirmDelete({
+      description: `Delete env var "${key}"? This clears it from the ConfigMap/Secret too.`,
+      run: async () => {
+        setBusy(true);
+        setError(null);
+        try {
+          await api.del(
+            `/api/applications/${appId}/env/${encodeURIComponent(key)}?namespace=${encodeURIComponent(namespace)}`,
+          );
+          await load();
+        } catch (e) {
+          setError((e as Error).message);
+        } finally {
+          setBusy(false);
+        }
+      },
+    });
   }
 
   function toggleReveal(id: number) {
@@ -221,7 +231,7 @@ export function EnvVarsPanel({ appId, namespace }: { appId: number; namespace: s
                       <Button
                         size="sm"
                         variant="ghost"
-                        onClick={() => void deleteVar(v.key)}
+                        onClick={() => deleteVar(v.key)}
                         disabled={busy}
                         aria-label={`Delete ${v.key}`}
                       >
@@ -235,6 +245,21 @@ export function EnvVarsPanel({ appId, namespace }: { appId: number; namespace: s
           </table>
         </div>
       )}
+
+      <ConfirmDialog
+        open={!!confirmDelete}
+        onOpenChange={(o) => {
+          if (!o) setConfirmDelete(null);
+        }}
+        title="Delete env var?"
+        description={confirmDelete?.description ?? ""}
+        confirmLabel="Delete"
+        onConfirm={() => {
+          const run = confirmDelete?.run;
+          setConfirmDelete(null);
+          if (run) void run();
+        }}
+      />
     </div>
   );
 }
