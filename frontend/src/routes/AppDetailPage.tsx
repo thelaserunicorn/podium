@@ -1,13 +1,14 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate, useParams } from "react-router-dom";
-import { History, Play, RefreshCw, Trash2 } from "lucide-react";
+import { History, Play, RefreshCw, Terminal, Trash2 } from "lucide-react";
 import { api } from "@/lib/api";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
 import { Input } from "@/components/ui/input";
 import { Label } from "@/components/ui/label";
-import { K8sOverview, type K8sState } from "@/components/K8sOverview";
+import { K8sOverview, type K8sState, type PodSummary } from "@/components/K8sOverview";
+import { RecentActivityCard } from "@/components/RecentActivityCard";
 import { EnvVarsPanel } from "@/components/EnvVarsPanel";
 import { AppLogsTab } from "@/components/AppLogsTab";
 import { AppEventsTab } from "@/components/AppEventsTab";
@@ -67,6 +68,12 @@ export function AppDetailPage() {
   // view to this deployment; the Deployments tab updates it whenever
   // the user picks a row in the history list.
   const [latestDeploymentID, setLatestDeploymentID] = useState<number | null>(null);
+  // Pods lifted from the K8sOverview poll so RecentActivityCard can
+  // render without spinning up its own timer. K8sOverview calls
+  // onPodsChange every poll (~5s); we mirror its state and reset to
+  // [] on namespace switch so we never show pods from the previous
+  // namespace during the brief window before the next poll lands.
+  const [pods, setPods] = useState<PodSummary[]>([]);
   // Pending destructive-action confirm for the top-right "Delete"
   // button. Rollback / delete-deployment live inside DeploymentsTab
   // and use their own confirm state below.
@@ -97,6 +104,13 @@ export function AppDetailPage() {
       }
     })();
   }, []);
+
+  // Reset the lifted pods whenever the user switches namespace so
+  // we don't render stale rows from the previous namespace during
+  // the ~5s window before K8sOverview's next poll lands.
+  useEffect(() => {
+    setPods([]);
+  }, [namespace]);
 
   if (error) {
     return (
@@ -218,16 +232,19 @@ export function AppDetailPage() {
                 <Row label="Created" value={new Date(app.created_at).toLocaleString()} />
                 <Row label="Updated" value={new Date(app.updated_at).toLocaleString()} />
                 <div className="border-t border-border pt-3">
-                  <K8sOverview appId={app.id} namespace={namespace} />
+                  <K8sOverview appId={app.id} namespace={namespace} onPodsChange={setPods} />
                 </div>
               </CardContent>
             </Card>
             <Card className="md:col-span-2">
               <CardHeader>
-                <CardTitle>Recent activity</CardTitle>
+                <CardTitle className="flex items-center gap-2">
+                  <Terminal className="h-4 w-4" />
+                  Recent activity
+                </CardTitle>
               </CardHeader>
-              <CardContent className="text-sm text-muted-foreground">
-                Switch to the Deployments tab to see history and start a new deploy.
+              <CardContent>
+                <RecentActivityCard namespace={namespace} pods={pods} />
               </CardContent>
             </Card>
           </div>

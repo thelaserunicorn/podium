@@ -30,6 +30,12 @@ export interface K8sState {
 interface K8sOverviewProps {
   appId: number;
   namespace: string;
+  // Optional notifier fired every time the polled state changes —
+  // AppDetailPage uses it to lift `pods` into RecentActivityCard so
+  // the new card doesn't need its own timer. The optional `?.`
+  // invocation at the call site means K8sOverview stays usable as a
+  // standalone component.
+  onPodsChange?: (pods: PodSummary[]) => void;
 }
 
 // K8sOverview is the live-runtime panel on the Overview tab. It polls
@@ -46,7 +52,7 @@ interface K8sOverviewProps {
 // than on the Deployments tab) because they operate on the running
 // Deployment the Overview already polls — the user sees the new
 // replica count without context-switching.
-export function K8sOverview({ appId, namespace }: K8sOverviewProps) {
+export function K8sOverview({ appId, namespace, onPodsChange }: K8sOverviewProps) {
   const [state, setState] = useState<K8sState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const cancelRef = useRef<(() => void) | null>(null);
@@ -85,6 +91,11 @@ export function K8sOverview({ appId, namespace }: K8sOverviewProps) {
       };
       setState(safe);
       setError(null);
+      // Lift the polled pods to whoever wants them (typically
+      // AppDetailPage → RecentActivityCard). Firing inside `tick`
+      // means the parent's copy is exactly as live as the local
+      // state — no second timer, no out-of-sync window.
+      onPodsChange?.(safe.pods);
       // Sync the slider to the live desired count the first time we
       // see a real (non-zero) value, so the user doesn't see "0"
       // flickering before the first poll lands.
@@ -99,7 +110,7 @@ export function K8sOverview({ appId, namespace }: K8sOverviewProps) {
         setError(msg);
       }
     }
-  }, [appId, namespace]);
+  }, [appId, namespace, onPodsChange]);
 
   useEffect(() => {
     let cancelled = false;
