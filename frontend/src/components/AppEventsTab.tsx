@@ -171,7 +171,12 @@ export function AppEventsTab({ namespace, deploymentId }: AppEventsTabProps) {
             </tr>
           </thead>
           <tbody>
-            {events.events.map((ev, i) => (
+            {/* Backend returns events newest-first (kubernetes/events.go
+                sortEventsByTimeDesc), but for a table the convention is
+                "most recent at the top" — same way BuildLogViewer reads.
+                Reverse the array on render so the user's eye lands on the
+                freshest event without scanning to the bottom of the table. */}
+            {[...events.events].reverse().map((ev, i) => (
               <tr key={`${ev.ts}-${i}`} className="border-t border-border">
                 <td className="px-3 py-2 font-mono text-muted-foreground">
                   {ev.ts ? new Date(ev.ts).toLocaleString() : "—"}
