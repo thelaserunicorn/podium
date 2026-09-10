@@ -81,6 +81,7 @@ type CreateRequest struct {
 }
 
 type UpdateRequest struct {
+	Name          string `json:"name"`
 	RepositoryURL string `json:"repository_url"`
 	ContainerPort int    `json:"container_port"`
 }
@@ -116,6 +117,8 @@ func mapErr(w http.ResponseWriter, err error) {
 		writeError(w, http.StatusNotFound, "not_found", "application not found")
 	case errors.Is(err, ErrDuplicateName):
 		writeError(w, http.StatusConflict, "duplicate_name", err.Error())
+	case errors.Is(err, ErrHasDeployments):
+		writeError(w, http.StatusConflict, "has_deployments", err.Error())
 	case errors.Is(err, ErrInvalidName), errors.Is(err, ErrInvalidRepoURL), errors.Is(err, ErrInvalidPort):
 		writeError(w, http.StatusBadRequest, "invalid_input", err.Error())
 	default:
@@ -228,6 +231,7 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	a, err := h.svc.Update(r.Context(), id, UpdateInput{
+		Name:          req.Name,
 		RepositoryURL: req.RepositoryURL,
 		ContainerPort: req.ContainerPort,
 		UserID:        uid,

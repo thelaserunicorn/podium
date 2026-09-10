@@ -2,6 +2,7 @@ package application_test
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"path/filepath"
@@ -313,6 +314,174 @@ func TestApplicationVersionMonotonic(t *testing.T) {
 		if got.Version != i {
 			t.Fatalf("after %d updates version: got %d want %d", i, got.Version, i)
 		}
+	}
+}
+
+// newCtxWithDB is a variant of newCtx that also returns the underlying
+// *sql.DB. The two rename-guard tests need it so they can insert a
+// dummy deployment row directly and exercise the ErrHasDeployments
+// branch in Service.Update.
+func newCtxWithDB(t *testing.T) (context.Context, *auth.Service, *application.Service, *sql.DB) {
+	t.Helper()
+	dir := t.TempDir()
+	path := filepath.Join(dir, "podium.db")
+	db, err := storage.Open(context.Background(), path, storage.Options{})
+	if err != nil {
+		t.Fatalf("storage.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = db.Close() })
+
+	authSvc := auth.NewService(db)
+	if err := auth.SeedAdmin(context.Background(), db, "root", "root-password"); err != nil {
+		t.Fatalf("SeedAdmin: %v", err)
+	}
+
+	userA := mustSignup(t, authSvc, "alice", "alice@example.com", "alice-secret")
+	userB := mustSignup(t, authSvc, "bob", "bob@example.com", "bob-secret")
+	_ = authSvc.ApproveUser(context.Background(), userA.ID)
+	_ = authSvc.ApproveUser(context.Background(), userB.ID)
+
+	appSvc := application.NewService(db)
+	return context.Background(), authSvc, appSvc.WithUsers(userA.ID, userB.ID), db
+}
+
+// mustInsertDeployment inserts a synthetic deployment row for appID
+// against environment 1 (podium-dev). Used by the rename-guard tests
+// to make the application "look deployed" without going through the
+// full orchestrator pipeline. Returns the new deployment id.
+func mustInsertDeployment(t *testing.T, db *sql.DB, appID int64) int64 {
+	t.Helper()
+	res, err := db.ExecContext(context.Background(), `
+		INSERT INTO deployments
+		    (application_id, environment_id, version, image, replicas, status)
+		VALUES (?, 1, 1, 'img:1', 1, 'FAILED')
+	`, appID)
+	if err != nil {
+		t.Fatalf("insert deployment: %v", err)
+	}
+	id, err := res.LastInsertId()
+	if err != nil {
+		t.Fatalf("LastInsertId: %v", err)
+	}
+	return id
+}
+
+// TestApplicationRenameAllowedWithoutDeployments: renaming a never-
+// deployed app must succeed and persist the new name. URL and port can
+// change in the same call (the UPDATE statement touches all three).
+func TestApplicationRenameAllowedWithoutDeployments(t *testing.T) {
+	t.Parallel()
+	ctx, _, appSvc, _ := newCtxWithDB(t)
+	alice := testUserA(ctx, appSvc)
+
+	created, err := appSvc.Create(ctx, application.CreateInput{
+		Name:          uniqueName("rename"),
+		RepositoryURL: "https://github.com/example/old",
+		ContainerPort: 8080,
+		UserID:        alice,
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+
+	newName := uniqueName("renamed")
+	got, err := appSvc.Update(ctx, created.ID, application.UpdateInput{
+		Name:          newName,
+		RepositoryURL: "https://github.com/example/new",
+		ContainerPort: 9090,
+		UserID:        alice,
+	})
+	if err != nil {
+		t.Fatalf("Update: %v", err)
+	}
+	if got.Name != newName {
+		t.Errorf("rename failed: got %q want %q", got.Name, newName)
+	}
+	if got.RepositoryURL != "https://github.com/example/new" {
+		t.Errorf("repo URL not updated: %q", got.RepositoryURL)
+	}
+	if got.ContainerPort != 9090 {
+		t.Errorf("port not updated: %d", got.ContainerPort)
+	}
+	if got.Version != 1 {
+		t.Errorf("version should bump to 1 on update, got %d", got.Version)
+	}
+}
+
+// TestApplicationRenameBlockedWithDeployments: once a deployment row
+// exists for an application, any rename attempt must be rejected with
+// ErrHasDeployments — the application name is baked into Kubernetes
+// Deployment / Service names (DECISIONS.md E), so silently renaming
+// would orphan live cluster resources. The original name, URL, and
+// port must all be unchanged after the rejected update.
+func TestApplicationRenameBlockedWithDeployments(t *testing.T) {
+	t.Parallel()
+	ctx, _, appSvc, db := newCtxWithDB(t)
+	alice := testUserA(ctx, appSvc)
+
+	created, err := appSvc.Create(ctx, application.CreateInput{
+		Name:          uniqueName("locked"),
+		RepositoryURL: "https://github.com/x/y",
+		ContainerPort: 8080,
+		UserID:        alice,
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	mustInsertDeployment(t, db, created.ID)
+
+	_, err = appSvc.Update(ctx, created.ID, application.UpdateInput{
+		Name:   uniqueName("renamed"),
+		UserID: alice,
+	})
+	if !errors.Is(err, application.ErrHasDeployments) {
+		t.Fatalf("expected ErrHasDeployments, got %v", err)
+	}
+
+	// Verify the original name stuck — the rejected UPDATE didn't
+	// half-apply the rename.
+	got, err := appSvc.Get(ctx, created.ID, alice)
+	if err != nil {
+		t.Fatalf("Get after rejected rename: %v", err)
+	}
+	if got.Name != created.Name {
+		t.Errorf("name changed despite rejection: got %q want %q", got.Name, created.Name)
+	}
+}
+
+// TestApplicationURLAndPortUpdatableWithDeployments: only the rename
+// is blocked when deployments exist. Updating the repository URL or
+// container port must still succeed regardless of deployment count —
+// those don't change K8s resource names.
+func TestApplicationURLAndPortUpdatableWithDeployments(t *testing.T) {
+	t.Parallel()
+	ctx, _, appSvc, db := newCtxWithDB(t)
+	alice := testUserA(ctx, appSvc)
+
+	created, err := appSvc.Create(ctx, application.CreateInput{
+		Name:          uniqueName("url"),
+		RepositoryURL: "https://github.com/x/old",
+		ContainerPort: 8080,
+		UserID:        alice,
+	})
+	if err != nil {
+		t.Fatalf("Create: %v", err)
+	}
+	mustInsertDeployment(t, db, created.ID)
+
+	got, err := appSvc.Update(ctx, created.ID, application.UpdateInput{
+		RepositoryURL: "https://github.com/x/new",
+		ContainerPort: 9090,
+		UserID:        alice,
+	})
+	if err != nil {
+		t.Fatalf("Update should allow url/port change with deployments: %v", err)
+	}
+	if got.RepositoryURL != "https://github.com/x/new" {
+		t.Errorf("URL not updated: %q", got.RepositoryURL)
+	}
+	if got.ContainerPort != 9090 {
+		t.Errorf("port not updated: %d", got.ContainerPort)
 	}
 }
 

@@ -1,11 +1,22 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { Layers, Plus, Trash2 } from "lucide-react";
+import { Layers, Pencil, Plus, Trash2 } from "lucide-react";
 import { api } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
 import { Card, CardContent, CardHeader, CardTitle } from "@/components/ui/card";
 import { Badge } from "@/components/ui/badge";
+import { Input } from "@/components/ui/input";
+import { Label } from "@/components/ui/label";
+import { Alert, AlertDescription } from "@/components/ui/alert";
+import {
+  Dialog,
+  DialogContent,
+  DialogDescription,
+  DialogFooter,
+  DialogHeader,
+  DialogTitle,
+} from "@/components/ui/dialog";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
 
 // LatestStatus mirrors the field shape on /api/applications when
@@ -41,6 +52,18 @@ export function AppListPage() {
   const [confirm, setConfirm] = useState<{
     description: string;
     run: () => Promise<void>;
+  } | null>(null);
+  // Edit dialog state. Distinct shape from `confirm` because it carries
+  // three form fields plus validation state. `null` means closed.
+  // The form is pre-filled with the application's current values when
+  // `startEdit` is called.
+  const [editState, setEditState] = useState<{
+    app: Application;
+    name: string;
+    repositoryUrl: string;
+    containerPort: number;
+    submitting: boolean;
+    error: string | null;
   } | null>(null);
   // Which bucket of apps to show. Default "all" preserves the old
   // behavior so a returning user sees everything until they opt in
@@ -108,6 +131,43 @@ export function AppListPage() {
         }
       },
     });
+  }
+
+  // startEdit opens the Edit dialog pre-filled with the application's
+  // current values. The AppCard's Edit button passes the app directly
+  // so we don't have to look it up by id again. The submit handler
+  // is wired in render to keep state colocated with the dialog.
+  function startEdit(a: Application) {
+    setEditState({
+      app: a,
+      name: a.name,
+      repositoryUrl: a.repository_url,
+      containerPort: a.container_port,
+      submitting: false,
+      error: null,
+    });
+  }
+
+  // submitEdit PUTs the new values. The backend may return 409 with
+  // has_deployments (rename attempted on a deployed app — shouldn't
+  // happen because the Edit button is disabled then, but defensive)
+  // or duplicate_name (rename collided with another of the user's
+  // apps). Both surface verbatim in the dialog's Alert.
+  async function submitEdit() {
+    if (!editState) return;
+    const { app, name, repositoryUrl, containerPort } = editState;
+    setEditState({ ...editState, submitting: true, error: null });
+    try {
+      await api.put<void>(`/api/applications/${app.id}`, {
+        name,
+        repository_url: repositoryUrl,
+        container_port: containerPort,
+      });
+      setEditState(null);
+      await load();
+    } catch (e) {
+      setEditState({ ...editState, submitting: true, error: (e as Error).message });
+    }
   }
 
   return (
@@ -230,6 +290,7 @@ export function AppListPage() {
                       app={a}
                       busy={busyId === a.id || (busyId !== null && busyId !== a.id)}
                       onDelete={() => void deleteApp(a)}
+                      onEdit={() => startEdit(a)}
                     />
                   ))}
                 </div>
@@ -253,6 +314,106 @@ export function AppListPage() {
           if (run) void run();
         }}
       />
+
+      {/*
+        Edit dialog. Mirrors the NewAppPage form layout (same labels,
+        same validation hints, same input ordering) so users get one
+        mental model for "define an application" regardless of whether
+        they're creating or editing.
+
+        The three form fields write back into editState through a
+        partial-replace pattern (spreading editState and overriding
+        the changed field) so React batches the updates correctly
+        and we don't lose any sibling state.
+      */}
+      <Dialog
+        open={!!editState}
+        onOpenChange={(o) => {
+          if (!o) setEditState(null);
+        }}
+      >
+        <DialogContent>
+          <DialogHeader>
+            <DialogTitle>Edit application</DialogTitle>
+            <DialogDescription>
+              Change the name, repository URL, or container port. Editing is disabled after the
+              first deploy because the application name is part of the Kubernetes resource names.
+            </DialogDescription>
+          </DialogHeader>
+
+          {editState && (
+            <form
+              onSubmit={(e) => {
+                e.preventDefault();
+                void submitEdit();
+              }}
+              className="space-y-4"
+            >
+              <div className="space-y-1.5">
+                <Label htmlFor="edit-name">Name</Label>
+                <Input
+                  id="edit-name"
+                  value={editState.name}
+                  onChange={(e) => setEditState({ ...editState, name: e.target.value })}
+                  required
+                  pattern="[a-z0-9]([-a-z0-9]*[a-z0-9])?"
+                  minLength={1}
+                  maxLength={63}
+                />
+                <p className="text-xs text-muted-foreground">
+                  DNS-friendly: [a-z0-9-], 1–63 chars.
+                </p>
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="edit-repo">Repository URL</Label>
+                <Input
+                  id="edit-repo"
+                  type="url"
+                  value={editState.repositoryUrl}
+                  onChange={(e) => setEditState({ ...editState, repositoryUrl: e.target.value })}
+                  required
+                  placeholder="https://github.com/owner/repo"
+                />
+                <p className="text-xs text-muted-foreground">Public GitHub repos only (MVP).</p>
+              </div>
+              <div className="space-y-1.5">
+                <Label htmlFor="edit-port">Container port</Label>
+                <Input
+                  id="edit-port"
+                  type="number"
+                  min={1}
+                  max={65535}
+                  value={editState.containerPort}
+                  onChange={(e) =>
+                    setEditState({ ...editState, containerPort: Number(e.target.value) })
+                  }
+                  required
+                />
+              </div>
+
+              {editState.error && (
+                <Alert variant="destructive">
+                  <AlertDescription>{editState.error}</AlertDescription>
+                </Alert>
+              )}
+
+              <DialogFooter>
+                <Button
+                  type="button"
+                  variant="outline"
+                  disabled={editState.submitting}
+                  onClick={() => setEditState(null)}
+                >
+                  Cancel
+                </Button>
+                <Button type="submit" disabled={editState.submitting}>
+                  {editState.submitting ? "Saving…" : "Save changes"}
+                </Button>
+              </DialogFooter>
+            </form>
+          )}
+        </DialogContent>
+      </Dialog>
     </div>
   );
 }
@@ -391,6 +552,7 @@ function AppCard({
   app: a,
   busy,
   onDelete,
+  onEdit,
 }: {
   app: Application;
   // `busy` is true when THIS card is mid-delete; we also disable
@@ -398,12 +560,19 @@ function AppCard({
   // can't fire off parallel deletes that race the reload.
   busy: boolean;
   onDelete: () => void;
+  onEdit: () => void;
 }) {
   const status = a.latest_status?.status ?? null;
+  // Renames are blocked by the backend the moment a deployment row
+  // exists (the app name is baked into K8s Deployment / Service names
+  // — see DECISIONS.md E). Disable the Edit button the instant the
+  // app has been deployed so the operator doesn't fire off a request
+  // the backend will reject; the title explains why.
+  const canEdit = status === null;
   return (
     // The outer wrapper is the visual card (border + accent + shadow).
-    // The Link is the clickable body. The Delete button is its own
-    // element in the footer.
+    // The Link is the clickable body. Edit + Delete live in the
+    // footer row beneath the link.
     <div
       className={cn(
         "group flex flex-col overflow-hidden rounded-lg border border-border bg-background shadow-sm transition-all",
@@ -444,7 +613,31 @@ function AppCard({
         </dl>
       </Link>
 
-      <div className="flex items-center justify-end border-t border-border px-4 py-2">
+      {/*
+        Footer row: Edit on the left, Delete on the right. Edit stays
+        visible on every card so the layout doesn't shift when a card
+        becomes non-editable — disabling in place is clearer than
+        hiding, and the title tooltip explains the restriction.
+      */}
+      <div className="flex items-center justify-between border-t border-border px-4 py-2">
+        <Button
+          size="sm"
+          variant="ghost"
+          disabled={busy || !canEdit}
+          onClick={(e) => {
+            e.stopPropagation();
+            onEdit();
+          }}
+          title={
+            canEdit
+              ? "Edit application name, repository URL, and container port"
+              : "Cannot edit — application has been deployed"
+          }
+          className="text-muted-foreground hover:text-foreground"
+        >
+          <Pencil className="h-4 w-4" />
+          Edit
+        </Button>
         <Button
           size="sm"
           variant="ghost"

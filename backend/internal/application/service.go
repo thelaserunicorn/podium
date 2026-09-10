@@ -38,8 +38,11 @@ type CreateInput struct {
 
 // UpdateInput supports partial updates. ContainerPort==0 is a sentinel
 // meaning "no change" because the validator rejects port 0 (validate.go),
-// so 0 is always safe to ignore.
+// so 0 is always safe to ignore. Name=="" is the same sentinel for
+// "leave the name as-is" — ValidateName rejects the empty string, so
+// the empty value is always safe to ignore.
 type UpdateInput struct {
+	Name          string
 	RepositoryURL string
 	ContainerPort int
 	UserID        int64
@@ -218,6 +221,13 @@ func (s *Service) LatestStatuses(ctx context.Context, appIDs []int64) (map[int64
 }
 
 // Update applies a partial update and bumps Version by 1.
+//
+// Three optional fields: Name, RepositoryURL, ContainerPort. Each empty
+// (or zero, for ContainerPort) means "leave as-is". A non-empty Name
+// triggers an extra ErrHasDeployments check — the application name is
+// baked into Kubernetes Deployment / Service names (DECISIONS.md E),
+// so renaming a live app would orphan its cluster resources. URL and
+// port changes are always allowed regardless of deployment count.
 func (s *Service) Update(ctx context.Context, id int64, in UpdateInput) (Application, error) {
 	if in.RepositoryURL != "" {
 		if err := ValidateRepositoryURL(in.RepositoryURL); err != nil {
@@ -229,12 +239,34 @@ func (s *Service) Update(ctx context.Context, id int64, in UpdateInput) (Applica
 			return Application{}, err
 		}
 	}
+	if in.Name != "" {
+		if err := ValidateName(in.Name); err != nil {
+			return Application{}, err
+		}
+	}
 
 	current, err := s.Get(ctx, id, in.UserID)
 	if err != nil {
 		return Application{}, err
 	}
 
+	newName := current.Name
+	if in.Name != "" {
+		// Renames are only permitted for apps that have never been
+		// deployed. Done after Get so we already have the row, and
+		// before touching the UPDATE so the user gets a clean 409
+		// instead of a half-applied rename.
+		var n int
+		if err := s.db.QueryRowContext(ctx,
+			`SELECT COUNT(*) FROM deployments WHERE application_id = ?`, id,
+		).Scan(&n); err != nil {
+			return Application{}, fmt.Errorf("application: count deployments: %w", err)
+		}
+		if n > 0 {
+			return Application{}, ErrHasDeployments
+		}
+		newName = in.Name
+	}
 	newURL := current.RepositoryURL
 	if in.RepositoryURL != "" {
 		newURL = in.RepositoryURL
@@ -246,14 +278,21 @@ func (s *Service) Update(ctx context.Context, id int64, in UpdateInput) (Applica
 
 	res, err := s.db.ExecContext(ctx, `
 		UPDATE applications
-		   SET repository_url = ?,
+		   SET name           = ?,
+		       repository_url = ?,
 		       container_port = ?,
 		       version        = version + 1,
 		       updated_at     = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
 		 WHERE id = ?
 		   AND user_id = ?
-	`, newURL, newPort, id, in.UserID)
+	`, newName, newURL, newPort, id, in.UserID)
 	if err != nil {
+		// SQLite enforces UNIQUE(user_id, name). On a rename that
+		// collides with another app the same user already owns we
+		// surface ErrDuplicateName instead of the raw driver error.
+		if strings.Contains(err.Error(), "UNIQUE constraint failed: applications.user_id, applications.name") {
+			return Application{}, ErrDuplicateName
+		}
 		return Application{}, fmt.Errorf("application: update: %w", err)
 	}
 	n, err := res.RowsAffected()

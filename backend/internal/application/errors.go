@@ -14,4 +14,12 @@ var (
 	ErrInvalidNamespace = errors.New("application: invalid namespace (must be DNS-1123)")
 	ErrNotFound         = errors.New("application: not found")
 	ErrDuplicateName    = errors.New("application: name already in use")
+	// ErrHasDeployments is returned by Service.Update when the caller
+	// tries to rename an application that already has at least one
+	// deployment row. The application name is baked into the Kubernetes
+	// Deployment / Service names (DECISIONS.md E), so silently renaming
+	// an app with live history would orphan the cluster resources.
+	// Mapped to 409 Conflict by the handler. URL and port updates are
+	// not affected by this restriction.
+	ErrHasDeployments = errors.New("application: cannot rename — has existing deployments")
 )

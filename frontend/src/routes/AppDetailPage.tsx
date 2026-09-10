@@ -277,7 +277,7 @@ export function AppDetailPage() {
               <CardHeader>
                 <CardTitle className="flex items-center gap-2">
                   <Terminal className="h-4 w-4" />
-                  Recent activity
+                  Terminal Shells
                 </CardTitle>
               </CardHeader>
               <CardContent>
@@ -591,7 +591,7 @@ function DeploymentsTab({
                       title="Roll back to this image"
                     >
                       <History className="h-4 w-4" />
-                      Roll back
+                      Restart
                     </Button>
                   )}
                   <Button
