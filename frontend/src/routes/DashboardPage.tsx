@@ -212,25 +212,35 @@ function Stat({
   label: string;
   value: string;
   hint?: string;
-  // Recolors just the big number so the operator sees fleet health
+  // Recolors just the label text so the operator sees fleet health
   // at a glance without the whole card turning into a colored block.
-  // `neutral` (default) leaves the value at the standard foreground
-  // color so the "Applications" total stays quiet next to the
-  // colored status numbers.
+  // The numeric value stays in the default foreground so "3" doesn't
+  // shout louder than the status it's reporting.
   //
-  // Inline Tailwind palette classes (emerald-700 / red-700) — same
+  // Inline Tailwind palette classes (emerald-600 / red-600) — same
   // pattern as K8sOverview's podPhaseVariant badge colors. When we
   // ship dark mode, swap these for semantic tokens defined in
   // index.css so they flip with the theme.
   tone?: "neutral" | "success" | "destructive";
 }) {
-  const valueClass =
-    tone === "success" ? "text-emerald-700" : tone === "destructive" ? "text-red-700" : null;
+  const labelClass =
+    tone === "success"
+      ? "text-emerald-600"
+      : tone === "destructive"
+        ? "text-red-600"
+        : null;
   return (
     <Card>
       <CardContent className="pt-6">
-        <p className="text-xs uppercase tracking-wide text-muted-foreground">{label}</p>
-        <p className={cn("mt-1 text-2xl font-semibold", valueClass ?? undefined)}>{value}</p>
+        <p
+          className={cn(
+            "text-xs font-semibold uppercase tracking-wide",
+            labelClass ?? "text-muted-foreground",
+          )}
+        >
+          {label}
+        </p>
+        <p className="mt-1 text-2xl font-semibold">{value}</p>
         {hint && <p className="text-xs text-muted-foreground">{hint}</p>}
       </CardContent>
     </Card>

@@ -60,7 +60,16 @@ export function Layout() {
           </div>
         </header>
         <main className="flex-1 p-6">
-          <Outlet />
+          {/*
+            Keying the wrapper on pathname unmounts/remounts the outlet
+            subtree on every navigation, which restarts the
+            `page-fade-in` animation defined in index.css. Without the
+            key change the same DOM node would stay mounted and the
+            animation would only play once on initial load.
+          */}
+          <div key={location.pathname} className="page-fade-in h-full">
+            <Outlet />
+          </div>
         </main>
       </div>
     </div>
