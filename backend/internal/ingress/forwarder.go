@@ -106,6 +106,48 @@ func (f *Forwarder) SetReadyTimeout(d time.Duration) {
 // tests and for the Router's port allocator.
 func (f *Forwarder) LocalPort() int { return f.localPort }
 
+// NeedsRestart reports whether the cached Forwarder should be evicted
+// and recreated. Used by Router.Lookup on cache hits so the user is
+// never handed a URL pointing at a kubectl subprocess that can no
+// longer forward traffic to its upstream Service.
+//
+// True when:
+//   - the subprocess has exited (the watch goroutine closed Done), OR
+//   - the local TCP port is no longer accepting connections
+//     (kubectl bound it, then exited without unbinding — OS may not
+//     have reaped the socket yet).
+//
+// False when:
+//   - the forwarder was never Start()ed (Lookup path only — handled
+//     separately), OR
+//   - the port accepts a connection within 250ms (most live cases).
+//
+// Known limitation: kubectl can stay bound to its local port after
+// the upstream Service was deleted, accepting connections but
+// returning empty replies on the data plane. This check cannot
+// distinguish "subprocess forwarding fine" from "subprocess bound but
+// upstream gone" — the user-facing click will surface that as an
+// empty/502 response from the browser. Eviction on delete+redeploy
+// relies on Router.Evict being called by the application service;
+// this method is the safety net for the (rare) case where kubectl
+// died on its own.
+func (f *Forwarder) NeedsRestart() bool {
+	f.mu.Lock()
+	if f.cmd == nil || isClosed(f.cmd.Done) {
+		f.mu.Unlock()
+		return true
+	}
+	port := f.localPort
+	f.mu.Unlock()
+	d := net.Dialer{Timeout: 250 * time.Millisecond}
+	conn, err := d.Dial("tcp", fmt.Sprintf("127.0.0.1:%d", port))
+	if err != nil {
+		return true
+	}
+	_ = conn.Close()
+	return false
+}
+
 // LocalURL returns the URL the user can open in a browser to see the
 // proxied app. Format: "http://127.0.0.1:<port>". The Forwarder must
 // have been Start()ed first; the URL only resolves once kubectl is

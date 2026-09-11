@@ -110,6 +110,11 @@ func (h *IngressURLHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		App:  appID,
 	}
 	w.Header().Set("Content-Type", "application/json")
+	// The URL is volatile — the backend's Router evicts the cached
+	// Forwarder on every delete+redeploy and allocates a new port.
+	// Forbid caching on the client AND any intermediate proxy so a
+	// subsequent poll cannot reuse the previous (now-dead) URL.
+	w.Header().Set("Cache-Control", "no-store, no-cache, must-revalidate, max-age=0")
 	w.WriteHeader(http.StatusOK)
 	_ = json.NewEncoder(w).Encode(resp)
 }

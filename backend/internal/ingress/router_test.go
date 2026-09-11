@@ -428,3 +428,136 @@ func sharedFakeRunner() *fakeRunner {
 }
 
 var _ = sharedFakeRunner // referenced via SetForwarderFactory above
+
+// TestRouter_EvictStopsAndClearsCache exercises the delete-deployment
+// lifecycle hook. After Evict(appID, ns), the cached Forwarder must
+// be stopped (subprocess gone) and the cache slot must be free (next
+// Lookup rebuilds).
+func TestRouter_EvictStopsAndClearsCache(t *testing.T) {
+	store, appSvc, appID, aliceID := seedRouterFixture(t, 8080)
+	if _, err := store.EnsureEnvironment(context.Background(), "podium-dev"); err != nil {
+		t.Fatalf("ensure env: %v", err)
+	}
+	bs := &fakeBootstrap{}
+	r := newTestRouter(t, store, bs, appSvc)
+	// Two ports so we can assert the post-Evict Lookup rebuilds
+	// (which allocates a fresh port).
+	r.SetPortRange(52000, 52001)
+
+	fwd1, err := r.Lookup(context.Background(), appID, "podium-dev", aliceID)
+	if err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+
+	// Capture the cmd slot before eviction so we can assert the
+	// underlying subprocess was killed, not just removed from the
+	// map.
+	r.mu.Lock()
+	entry, ok := r.byRoute[routeKey{appID: appID, ns: "podium-dev"}]
+	r.mu.Unlock()
+	if !ok || entry.fwd != fwd1 {
+		t.Fatalf("route not in cache as expected")
+	}
+
+	r.Evict(appID, "podium-dev")
+
+	// Cache entry must be gone.
+	r.mu.Lock()
+	_, stillCached := r.byRoute[routeKey{appID: appID, ns: "podium-dev"}]
+	r.mu.Unlock()
+	if stillCached {
+		t.Errorf("Evict left the route in the cache")
+	}
+
+	// Next Lookup must rebuild from scratch (new *Forwarder) and
+	// re-run the bootstrap hooks — that's how the next deployment's
+	// Service gets a fresh port-forward.
+	fwd2, err := r.Lookup(context.Background(), appID, "podium-dev", aliceID)
+	if err != nil {
+		t.Fatalf("Lookup after Evict: %v", err)
+	}
+	if fwd2 == fwd1 {
+		t.Errorf("Lookup after Evict returned the same *Forwarder (cache should be empty)")
+	}
+	if got := len(bs.ensureCalls); got != 2 {
+		t.Errorf("EnsureNamespace calls=%d after eviction+relookup, want 2", got)
+	}
+	_ = fwd2.Stop()
+}
+
+// TestRouter_EvictIsIdempotent: calling Evict twice (or before any
+// Lookup) must not panic and must not affect other routes.
+func TestRouter_EvictIsIdempotent(t *testing.T) {
+	store, appSvc, appID, aliceID := seedRouterFixture(t, 8080)
+	if _, err := store.EnsureEnvironment(context.Background(), "podium-dev"); err != nil {
+		t.Fatalf("ensure env: %v", err)
+	}
+	r := newTestRouter(t, store, &fakeBootstrap{}, appSvc)
+	r.SetPortRange(52010, 52010)
+
+	// Evict with no route cached — must not panic.
+	r.Evict(appID, "podium-dev")
+
+	if _, err := r.Lookup(context.Background(), appID, "podium-dev", aliceID); err != nil {
+		t.Fatalf("Lookup: %v", err)
+	}
+	// Second evict on the same key — also a no-op (entry already gone
+	// after the first one).
+	r.Evict(appID, "podium-dev")
+	r.Evict(appID, "podium-dev")
+
+	r.mu.Lock()
+	n := len(r.byRoute)
+	r.mu.Unlock()
+	if n != 0 {
+		t.Errorf("byRoute size=%d after double Evict, want 0", n)
+	}
+}
+
+// TestRouter_EvictAppClearsOnlyMatchingRoutes: EvictApp should drop
+// every cached route for the given appID while leaving routes for
+// other apps intact. Used when the whole application is deleted.
+func TestRouter_EvictAppClearsOnlyMatchingRoutes(t *testing.T) {
+	store, appSvc, appA, aliceID := seedRouterFixture(t, 8080)
+	appB, err := appSvc.Create(context.Background(), application.CreateInput{
+		Name: "second", RepositoryURL: "https://github.com/x/y", ContainerPort: 9090, UserID: aliceID,
+	})
+	if err != nil {
+		t.Fatalf("create appB: %v", err)
+	}
+	for _, ns := range []string{"podium-dev", "podium-staging"} {
+		if _, err := store.EnsureEnvironment(context.Background(), ns); err != nil {
+			t.Fatalf("ensure %s: %v", ns, err)
+		}
+	}
+	bs := &fakeBootstrap{}
+	r := newTestRouter(t, store, bs, appSvc)
+	r.SetPortRange(52020, 52030)
+
+	// appA: two routes (dev, staging). appB: one route (dev).
+	for _, ns := range []string{"podium-dev", "podium-staging"} {
+		if _, err := r.Lookup(context.Background(), appA, ns, aliceID); err != nil {
+			t.Fatalf("lookup A %s: %v", ns, err)
+		}
+	}
+	fwdB, err := r.Lookup(context.Background(), appB.ID, "podium-dev", aliceID)
+	if err != nil {
+		t.Fatalf("lookup B: %v", err)
+	}
+
+	r.EvictApp(appA)
+
+	r.mu.Lock()
+	_, aCached := r.byRoute[routeKey{appID: appA, ns: "podium-dev"}]
+	_, aCached2 := r.byRoute[routeKey{appID: appA, ns: "podium-staging"}]
+	bEntry, bCached := r.byRoute[routeKey{appID: appB.ID, ns: "podium-dev"}]
+	r.mu.Unlock()
+
+	if aCached || aCached2 {
+		t.Errorf("appA routes still in cache after EvictApp")
+	}
+	if !bCached || bEntry.fwd != fwdB {
+		t.Errorf("appB route was disturbed by EvictApp for appA")
+	}
+	_ = fwdB.Stop()
+}

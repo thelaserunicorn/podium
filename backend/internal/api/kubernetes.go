@@ -123,12 +123,21 @@ func (h *K8sHandler) GetAppState(w http.ResponseWriter, r *http.Request) {
 
 	cur, des, err := h.client.CurrentReplicas(ctx, env.Namespace, depName)
 	if err != nil {
-		// Deployment might not exist yet (build not finished). Treat
-		// as zero replicas — the dashboard can show "starting".
+		// Deployment might not exist yet (build not finished) or might
+		// have just been deleted. Either way, leave DeploymentName
+		// empty so the frontend can distinguish "no live deployment"
+		// from "live deployment with 0/0 replicas".
 		h.logger.Info("get replicas (will treat as 0/0)", "err", err, "app", appID, "ns", env.Namespace)
 	} else {
 		resp.CurrentReplicas = cur
 		resp.DesiredReplicas = des
+		// Only advertise the deployment name when we actually
+		// observed it in the cluster. The frontend uses
+		// `deployment_name` as the "has live deployment" signal
+		// (AppUrlCardWithState); if we always echoed the deterministic
+		// name, that flag would stay true through a delete-then-redeploy
+		// cycle and the URL card would keep showing the stale URL.
+		resp.DeploymentName = depName
 	}
 
 	pods, err := h.client.ListPods(ctx, env.Namespace, kubernetes.AppLabelSelector(app.Name))
@@ -138,7 +147,6 @@ func (h *K8sHandler) GetAppState(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	resp.Namespace = env.Namespace
-	resp.DeploymentName = depName
 	// ListPods already returns a non-nil empty slice, but we coerce
 	// defensively in case a future implementation changes that.
 	if pods != nil {

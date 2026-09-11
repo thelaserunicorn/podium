@@ -6,11 +6,17 @@ export interface ApiError extends Error {
   code?: string;
 }
 
-async function request<T>(method: string, path: string, body?: unknown): Promise<T> {
+async function request<T>(
+  method: string,
+  path: string,
+  body?: unknown,
+  initOverride?: RequestInit,
+): Promise<T> {
   const init: RequestInit = {
     method,
     credentials: "include",
     headers: body ? { "Content-Type": "application/json" } : {},
+    ...initOverride,
   };
   if (body !== undefined) {
     init.body = JSON.stringify(body);
@@ -38,7 +44,7 @@ async function request<T>(method: string, path: string, body?: unknown): Promise
 }
 
 export const api = {
-  get: <T>(path: string) => request<T>("GET", path),
+  get: <T>(path: string, init?: RequestInit) => request<T>("GET", path, undefined, init),
   post: <T>(path: string, body?: unknown) => request<T>("POST", path, body),
   put: <T>(path: string, body?: unknown) => request<T>("PUT", path, body),
   del: <T>(path: string) => request<T>("DELETE", path),

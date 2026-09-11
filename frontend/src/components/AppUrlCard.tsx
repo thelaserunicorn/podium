@@ -12,6 +12,12 @@ interface AppUrlCardProps {
   // selected namespace — kubectl would fail to start a port-forward
   // against a Service that doesn't exist.
   hasDeployment: boolean;
+  // stateKey bumps on every successful /state poll. Including it in
+  // the fetch-effect's dependency list forces a re-fetch even when
+  // hasDeployment stays true through a fast delete+redeploy cycle
+  // (the backend's ingress cache is evicted on delete, so the next
+  // /ingress call returns a fresh Forwarder with a new port).
+  stateKey: number;
 }
 
 // AppUrlCard renders the live-app URL for (appID, namespace). The
@@ -22,7 +28,7 @@ interface AppUrlCardProps {
 // We open in a NEW tab so the deployed app gets a fresh browser
 // context (no shared session cookie — the proxied app lives on a
 // different port and we don't pretend it shares Podium's auth).
-export function AppUrlCard({ appID, namespace, hasDeployment }: AppUrlCardProps) {
+export function AppUrlCard({ appID, namespace, hasDeployment, stateKey }: AppUrlCardProps) {
   const [state, setState] = useState<
     | { kind: "idle" }
     | { kind: "loading" }
@@ -31,9 +37,9 @@ export function AppUrlCard({ appID, namespace, hasDeployment }: AppUrlCardProps)
   >({ kind: "idle" });
   const [copied, setCopied] = useState(false);
 
-  // Fetch the URL whenever (appID, namespace) change. The backend
-  // starts the port-forward as part of this call, so by the time we
-  // render the link, it's hot.
+  // Fetch the URL whenever (appID, namespace) change OR the parent
+  // bumps stateKey. The backend starts the port-forward as part of
+  // this call, so by the time we render the link, it's hot.
   useEffect(() => {
     if (!hasDeployment) {
       setState({ kind: "idle" });
@@ -53,7 +59,7 @@ export function AppUrlCard({ appID, namespace, hasDeployment }: AppUrlCardProps)
     return () => {
       cancelled = true;
     };
-  }, [appID, namespace, hasDeployment]);
+  }, [appID, namespace, hasDeployment, stateKey]);
 
   // Reset the "Copied" badge on URL change so a stale confirmation
   // doesn't survive a namespace switch.
@@ -125,7 +131,9 @@ export function AppUrlCard({ appID, namespace, hasDeployment }: AppUrlCardProps)
       </CardHeader>
       <CardContent className="space-y-3">
         <div className="flex flex-wrap items-center gap-2">
-          <code className="break-all rounded bg-muted px-2 py-1 font-mono text-xs">{ingress.url}</code>
+          <code className="break-all rounded bg-muted px-2 py-1 font-mono text-xs">
+            {ingress.url}
+          </code>
           <Button size="sm" variant="outline" onClick={() => void copy()} aria-label="Copy URL">
             {copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
             {copied ? "Copied" : "Copy"}

@@ -155,6 +155,12 @@ func run() error {
 	var ingressRouter *ingress.Router
 	if k8sClient != nil {
 		ingressRouter = ingress.NewRouter(queries, k8sClient, appSvc, logger)
+		// Hand the router to the application service so Delete and
+		// DeleteDeployment drop the cached port-forward route when
+		// they tear down the k8s Service. Without this hook the user
+		// would see a stale localhost URL pointing at a dead kubectl
+		// subprocess after deleting a deployment.
+		appSvc = appSvc.WithIngressEvicter(ingressRouter)
 		api.MountIngressURL(mux, api.NewIngressURLHandler(ingressRouter, logger))
 	} else {
 		logger.Warn("ingress disabled; /api/applications/{id}/ingress will return 502 until a Kubernetes cluster is reachable")

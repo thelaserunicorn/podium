@@ -26,8 +26,25 @@ export interface IngressURL {
  * can open it directly in a new tab. We never prepend the Podium
  * origin here — the port-forward listens on the host loopback
  * regardless of how Podium itself is addressed.
+ *
+ * Cache: the response is intentionally uncached on the client. The
+ * ingress URL is volatile — the port can change whenever the user
+ * deletes + redeploys an app (the backend's Router evicts the cached
+ * Forwarder and allocates a new port). If the browser cached the
+ * previous response, a redeploy would leave the card pointing at the
+ * OLD port while the OLD kubectl subprocess has been killed. We append
+ * a unique `_t` query param + send `Cache-Control: no-cache` so every
+ * call reaches the server.
  */
 export async function fetchIngressURL(appID: number, namespace: string): Promise<IngressURL> {
-  const qs = new URLSearchParams({ ns: namespace }).toString();
-  return api.get<IngressURL>(`/api/applications/${appID}/ingress?${qs}`);
+  const qs = new URLSearchParams({
+    ns: namespace,
+    // Uniquifier so the browser doesn't reuse a cached response when
+    // the (appID, namespace) pair is unchanged across polls. The
+    // backend ignores the param.
+    _t: `${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+  }).toString();
+  return api.get<IngressURL>(`/api/applications/${appID}/ingress?${qs}`, {
+    cache: "no-store",
+  });
 }

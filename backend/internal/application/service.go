@@ -53,6 +53,7 @@ type Service struct {
 	db        *sql.DB
 	queries   *storage.Queries   // optional; populated by WithQueries for dashboard status lookups
 	cleaner   AppResourceCleaner // optional; populated by WithResourceCleaner for k8s cleanup on Delete and DeleteDeployment
+	ingress   IngressEvicter     // optional; populated by WithIngressEvicter so delete paths drop the cached port-forward URL
 	testUsers *testUserIDs       // see WithUsers — nil in production
 }
 
@@ -83,6 +84,19 @@ func (s *Service) WithQueries(q *storage.Queries) *Service {
 func (s *Service) WithResourceCleaner(c AppResourceCleaner) *Service {
 	clone := *s
 	clone.cleaner = c
+	return &clone
+}
+
+// WithIngressEvicter returns a copy of the Service that will evict
+// cached port-forward routes when an app or deployment is deleted.
+// Optional — when nil (no router wired, e.g. Podium booted before the
+// cluster came up) the delete paths stay silent on the ingress side;
+// the SQLite + k8s cleanup still happens, and the next ingress
+// lookup will simply rebuild the route from scratch because the
+// underlying Service is gone anyway.
+func (s *Service) WithIngressEvicter(e IngressEvicter) *Service {
+	clone := *s
+	clone.ingress = e
 	return &clone
 }
 
@@ -383,16 +397,25 @@ func (s *Service) Delete(ctx context.Context, id, userID int64) error {
 				"namespaces", namespaceNames(envs),
 				"hint", "Podium booted before the cluster was reachable; restart after `kind create cluster`")
 		}
-		return nil
-	}
-	for i := range envs {
-		if cerr := s.cleaner.DeleteAppResources(ctx, &app, envs[i].Namespace); cerr != nil {
-			// Best-effort: log via the default logger and continue.
-			// The SQLite row is already gone; orphaned cluster
-			// resources are recoverable, a stuck delete isn't.
-			slog.Default().Warn("clean k8s resources after app delete",
-				"app_id", app.ID, "namespace", envs[i].Namespace, "err", cerr)
+	} else {
+		for i := range envs {
+			if cerr := s.cleaner.DeleteAppResources(ctx, &app, envs[i].Namespace); cerr != nil {
+				// Best-effort: log via the default logger and continue.
+				// The SQLite row is already gone; orphaned cluster
+				// resources are recoverable, a stuck delete isn't.
+				slog.Default().Warn("clean k8s resources after app delete",
+					"app_id", app.ID, "namespace", envs[i].Namespace, "err", cerr)
+			}
 		}
+	}
+
+	// Drop every cached port-forward route for this app. The k8s
+	// Services that backed those routes are gone (or about to be);
+	// leaving them cached would hand the browser stale URLs that
+	// either resolve to nothing or point at a dead kubectl subprocess.
+	// EvictApp is a no-op when no router is wired.
+	if s.ingress != nil {
+		s.ingress.EvictApp(app.ID)
 	}
 	return nil
 }

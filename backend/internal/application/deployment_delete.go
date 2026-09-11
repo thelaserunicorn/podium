@@ -97,5 +97,21 @@ func (s *Service) DeleteDeployment(ctx context.Context, deploymentID, userID int
 		}
 		return fmt.Errorf("application: soft-delete deployment: %w", err)
 	}
+
+	// Drop the cached port-forward for this (app, namespace). The k8s
+	// Service is gone (or about to be); the cached Forwarder is now
+	// pointing at a dead upstream. Evicting here means the next
+	// `GET /api/applications/{id}/ingress?ns=<this>` starts a fresh
+	// Forwarder against whatever the redeploy creates, instead of
+	// handing the browser a stale URL that won't resolve.
+	//
+	// We evict AFTER the SQLite soft-delete so a Redis-style "evict
+	// then crash" race can't leave the user with a deploy row that
+	// exists in SQLite but no longer has a backing ingress route —
+	// they would already see the URL as "unreachable" before the
+	// delete completes, and a concurrent redeploy will recreate both.
+	if s.ingress != nil && env != nil {
+		s.ingress.Evict(app.ID, env.Namespace)
+	}
 	return nil
 }

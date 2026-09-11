@@ -14,6 +14,7 @@ import { AppLogsTab } from "@/components/AppLogsTab";
 import { AppEventsTab } from "@/components/AppEventsTab";
 import { AppUrlCard } from "@/components/AppUrlCard";
 import { ConfirmDialog } from "@/components/ConfirmDialog";
+import { useToast } from "@/lib/toast";
 
 interface Application {
   id: number;
@@ -296,6 +297,7 @@ export function AppDetailPage() {
           <CardContent>
             <DeploymentsTab
               appId={app.id}
+              appName={app.name}
               namespace={effectiveNamespace}
               useCustom={useCustom}
               customNamespace={customNamespace}
@@ -368,6 +370,7 @@ function Row({ label, value }: { label: string; value: string }) {
 
 function DeploymentsTab({
   appId,
+  appName,
   namespace,
   useCustom,
   customNamespace,
@@ -375,6 +378,10 @@ function DeploymentsTab({
   onSelect,
 }: {
   appId: number;
+  // Application name — forwarded to BuildLogViewer so the
+  // deployment-finished toast can say "<appName> deployed" instead of
+  // the cryptic "Deployment #42". The viewer doesn't need to fetch it.
+  appName: string;
   // The *effective* namespace — the parent's resolved value (already
   // folded from customNamespace when useCustom is true). We just
   // forward it to the backend in deploy() / load().
@@ -612,7 +619,13 @@ function DeploymentsTab({
             ))}
           </ul>
 
-          {selected && <BuildLogViewer deployment={selected} onClose={() => setSelected(null)} />}
+          {selected && (
+            <BuildLogViewer
+              deployment={selected}
+              appName={appName}
+              onClose={() => setSelected(null)}
+            />
+          )}
         </div>
       )}
 
@@ -634,13 +647,26 @@ function DeploymentsTab({
   );
 }
 
-function BuildLogViewer({ deployment, onClose }: { deployment: Deployment; onClose: () => void }) {
+function BuildLogViewer({
+  deployment,
+  appName,
+  onClose,
+}: {
+  deployment: Deployment;
+  // Application name — used in the deployment-finished toast. Kept as
+  // a prop (not fetched here) because the parent already has it on
+  // hand; saves one round-trip and keeps the viewer stateless w.r.t.
+  // application metadata.
+  appName: string;
+  onClose: () => void;
+}) {
   const [lines, setLines] = useState<LogLine[]>([]);
   const [cursor, setCursor] = useState<string | null>(null);
   const [status, setStatus] = useState(deployment.status);
   const [error, setError] = useState<string | null>(null);
   const cancelRef = useRef<(() => void) | null>(null);
   const scrollerRef = useRef<HTMLDivElement | null>(null);
+  const { toast } = useToast();
 
   const fetchOnce = useCallback(async () => {
     try {
@@ -654,7 +680,11 @@ function BuildLogViewer({ deployment, onClose }: { deployment: Deployment; onClo
       }
       const depRes = await api.get<{ deployment: Deployment }>(`/api/deployments/${deployment.id}`);
       setStatus(depRes.deployment.status);
-      if (depRes.deployment.status === "BUILT" || depRes.deployment.status === "FAILED") {
+      if (
+        depRes.deployment.status === "RUNNING" ||
+        depRes.deployment.status === "FAILED" ||
+        depRes.deployment.status === "BUILT"
+      ) {
         return true; // done
       }
       return false;
@@ -663,6 +693,37 @@ function BuildLogViewer({ deployment, onClose }: { deployment: Deployment; onClo
       return true; // stop polling on error
     }
   }, [cursor, deployment.id]);
+
+  // Fire a top-of-screen toast when the deployment reaches a terminal
+  // state. We compare against the *previous* status (ref, not state)
+  // because the polling effect below re-runs whenever `fetchOnce`
+  // changes — using state would double-fire on every poll. Ref + the
+  // effect's dependency on `status` keeps it to exactly one toast per
+  // transition.
+  //
+  // We toast on RUNNING (success) and FAILED (failure), but skip BUILT
+  // — the user is still on the Deployments tab waiting for k8s to
+  // roll the pods out, and "built" is not a final answer.
+  const lastNotifiedStatusRef = useRef<Deployment["status"]>(deployment.status);
+  useEffect(() => {
+    const prev = lastNotifiedStatusRef.current;
+    if (prev === status) return;
+    lastNotifiedStatusRef.current = status;
+    if (status === "RUNNING") {
+      toast({
+        title: "Application deployed",
+        description: `${appName} is running in ${deployment.image}.`,
+        variant: "success",
+      });
+    } else if (status === "FAILED") {
+      toast({
+        title: "Deployment failed",
+        description:
+          deployment.reason ?? `${appName} did not reach RUNNING. Check build logs and events.`,
+        variant: "error",
+      });
+    }
+  }, [status, appName, deployment.image, deployment.reason, toast]);
 
   useEffect(() => {
     let cancelled = false;
@@ -764,19 +825,39 @@ function statusVariant(
   }
 }
 
-// AppUrlCardWithState polls /state once to learn whether the
-// (app, namespace) pair has a live Deployment in the cluster. If it
-// does, the Service exists and the reverse-proxy URL is reachable —
+// AppUrlCardWithState polls /state every few seconds to learn whether
+// the (app, namespace) pair has a live Deployment in the cluster. If
+// it does, the Service exists and the reverse-proxy URL is reachable —
 // render the URL card. Otherwise show the empty state ("deploy at
-// least once"). This is a small wrapper around AppUrlCard; the URL
-// card itself stays purely presentational.
+// least once").
+//
+// Why a poll instead of a one-shot on mount: the user can delete a
+// deployment and redeploy without leaving the app detail page (the
+// namespace picker doesn't change). Without a poll the `hasDeployment`
+// flag would stay pinned to whatever it was when the page loaded, the
+// URL card would keep showing the old URL, and the user could click
+// "Open" on a port-forward whose target Service was just torn down.
+// Reusing the same ~5s cadence as K8sOverview keeps the two panels in
+// sync — they read the same /state endpoint.
 function AppUrlCardWithState({ appId, namespace }: { appId: number; namespace: string }) {
   const [hasDeployment, setHasDeployment] = useState(false);
+  // `stateKey` bumps on every successful /state poll so the URL card
+  // re-fetches even when hasDeployment stays true. Why this matters:
+  // delete + redeploy can happen within a single 5s poll window. The
+  // backend's port-forward cache is evicted on delete and a fresh
+  // Forwarder (with a new localhost port) is created on the next
+  // /ingress call after the redeploy. If we only re-fetched when
+  // hasDeployment flipped false→true, a fast redeploy would leave the
+  // card showing the OLD port even though the underlying cache had
+  // been replaced.
+  const [stateKey, setStateKey] = useState(0);
 
   useEffect(() => {
     let cancelled = false;
-    setHasDeployment(false);
-    void (async () => {
+    let timer: ReturnType<typeof setTimeout> | null = null;
+
+    const tick = async () => {
+      if (cancelled) return;
       try {
         const res = await api.get<K8sState>(
           `/api/applications/${appId}/state?namespace=${encodeURIComponent(namespace)}`,
@@ -787,14 +868,32 @@ function AppUrlCardWithState({ appId, namespace }: { appId: number; namespace: s
         // uses to decide whether to create the Service (the URL
         // card's pre-condition).
         setHasDeployment(!!res?.available && !!res?.deployment_name);
+        // Always bump — the card re-fetches every poll cycle.
+        setStateKey((k) => k + 1);
       } catch {
         if (!cancelled) setHasDeployment(false);
       }
-    })();
+      if (!cancelled) timer = setTimeout(tick, 5000);
+    };
+    // Reset to false synchronously so a namespace switch never shows
+    // a stale URL from the previous namespace while the first poll
+    // for the new one is in flight.
+    setHasDeployment(false);
+    setStateKey((k) => k + 1);
+    void tick();
+
     return () => {
       cancelled = true;
+      if (timer) clearTimeout(timer);
     };
   }, [appId, namespace]);
 
-  return <AppUrlCard appID={appId} namespace={namespace} hasDeployment={hasDeployment} />;
+  return (
+    <AppUrlCard
+      appID={appId}
+      namespace={namespace}
+      hasDeployment={hasDeployment}
+      stateKey={stateKey}
+    />
+  );
 }

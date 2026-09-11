@@ -301,3 +301,101 @@ func TestDelete_NoCleanerWithoutDeploymentsStaysSilent(t *testing.T) {
 		t.Errorf("unexpected Warn for fresh app with no prior deployments:\n%s", logs)
 	}
 }
+
+// fakeEvicter records every Evict / EvictApp call so we can assert
+// the application service drops the cached port-forward route when an
+// app or single deployment is deleted. Mirrors fakeCleaner above; kept
+// in this file so the eviction tests live next to the cleaner tests.
+type fakeEvicter struct {
+	mu          sync.Mutex
+	evictCalls  []evictCall
+	evictAppIDs []int64
+}
+
+type evictCall struct {
+	appID     int64
+	namespace string
+}
+
+func (f *fakeEvicter) Evict(appID int64, namespace string) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.evictCalls = append(f.evictCalls, evictCall{appID: appID, namespace: namespace})
+}
+
+func (f *fakeEvicter) EvictApp(appID int64) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.evictAppIDs = append(f.evictAppIDs, appID)
+}
+
+// TestDeleteDeployment_EvictsIngressRoute proves the deployment-delete
+// hook wires through to the ingress router. After deleting a
+// deployment, Evict must be called exactly once with the deployment's
+// (appID, namespace). Without this hook the user would see a stale
+// localhost URL pointing at a dead kubectl subprocess.
+func TestDeleteDeployment_EvictsIngressRoute(t *testing.T) {
+	ctx, svc, q, _, appID, userID := cleanupSvc(t)
+	ev := &fakeEvicter{}
+	svc = svc.WithIngressEvicter(ev)
+
+	envID := mustEnvID(t, q, ctx, "podium-staging")
+	list, err := q.ListDeployments(ctx, appID, envID)
+	if err != nil {
+		t.Fatalf("list deployments: %v", err)
+	}
+	if len(list) != 1 {
+		t.Fatalf("seeded deployment count = %d, want 1", len(list))
+	}
+	depID := list[0].ID
+
+	if err := svc.DeleteDeployment(ctx, depID, userID); err != nil {
+		t.Fatalf("DeleteDeployment: %v", err)
+	}
+	if len(ev.evictCalls) != 1 {
+		t.Fatalf("Evict calls=%d want 1; %+v", len(ev.evictCalls), ev.evictCalls)
+	}
+	got := ev.evictCalls[0]
+	if got.appID != appID || got.namespace != "podium-staging" {
+		t.Errorf("Evict args: %+v want (appID=%d, ns=podium-staging)", got, appID)
+	}
+	if len(ev.evictAppIDs) != 0 {
+		t.Errorf("EvictApp called %d times for a single-deployment delete (want 0)", len(ev.evictAppIDs))
+	}
+}
+
+// TestDelete_EvictsAllIngressRoutesForApp: when the whole app is
+// deleted, EvictApp must run once with the app id (the router iterates
+// its own routes). Single-deployment delete must NOT call EvictApp.
+func TestDelete_EvictsAllIngressRoutesForApp(t *testing.T) {
+	ctx, svc, _, _, appID, userID := cleanupSvc(t)
+	ev := &fakeEvicter{}
+	svc = svc.WithIngressEvicter(ev)
+
+	if err := svc.Delete(ctx, appID, userID); err != nil {
+		t.Fatalf("Delete: %v", err)
+	}
+	if len(ev.evictAppIDs) != 1 || ev.evictAppIDs[0] != appID {
+		t.Errorf("EvictApp calls=%v want [%d]", ev.evictAppIDs, appID)
+	}
+	// Whole-app delete should not also fire per-namespace Evict calls;
+	// the router owns its own fan-out.
+	if len(ev.evictCalls) != 0 {
+		t.Errorf("Evict calls=%d during whole-app delete (want 0); %+v", len(ev.evictCalls), ev.evictCalls)
+	}
+}
+
+// TestDeleteDeployment_NilEvicterIsSafe: when the service is wired
+// without an evicter (Podium booted before the cluster was reachable),
+// delete paths must not panic.
+func TestDeleteDeployment_NilEvicterIsSafe(t *testing.T) {
+	ctx, svc, q, _, appID, userID := cleanupSvc(t) // no WithIngressEvicter
+	envID := mustEnvID(t, q, ctx, "podium-staging")
+	list, err := q.ListDeployments(ctx, appID, envID)
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	if err := svc.DeleteDeployment(ctx, list[0].ID, userID); err != nil {
+		t.Fatalf("DeleteDeployment with nil evicter: %v", err)
+	}
+}

@@ -192,21 +192,59 @@ func (r *Router) Lookup(ctx context.Context, appID int64, ns string, ownerID int
 			}
 			entry = r.byRoute[key]
 		}
+		// A cached Forwarder's kubectl subprocess may be silently
+		// broken even though the cache entry is still present. The
+		// subprocess can survive a Service deletion holding its local
+		// port open but no longer able to forward traffic — in that
+		// state `fwd.IsAlive()` (subprocess status + port listen)
+		// returns true but a real dial gets an empty reply. The
+		// cheapest reliable check is a 250ms TCP connect: if the
+		// port doesn't accept a connection at all (kubectl has fully
+		// died) IsAlive catches it; if it accepts but the upstream
+		// is gone the user already gets a fast error on click.
+		//
+		// To avoid handing out URLs that resolve to broken
+		// port-forwards after a delete+redeploy cycle, we also
+		// detect the "subprocess was reused" pattern: if the cached
+		// forwarder's lastErr is non-nil it has failed at least once
+		// and the next Dial will re-spawn — we evict it here so the
+		// Lookup returns a fresh one.
+		if entry.fwd != nil && entry.fwd.NeedsRestart() {
+			if r.log != nil {
+				r.log.Info("ingress lookup dead forwarder, evicting",
+					"app_id", appID, "ns", ns, "port", entry.fwd.LocalPort())
+			}
+			old := entry.fwd
+			delete(r.byRoute, key)
+			r.mu.Unlock()
+			_ = old.Stop()
+			// Fall through to the first-lookup path below.
+			goto freshCreate
+		}
 		r.mu.Unlock()
 		if entry.err != nil {
 			return nil, entry.err
+		}
+		if r.log != nil {
+			r.log.Info("ingress lookup cache hit", "app_id", appID, "ns", ns, "port", entry.fwd.LocalPort())
 		}
 		return entry.fwd, nil
 	}
 
 	// First lookup: claim the slot, release the lock while we do the
-	// slow work.
+	// slow work. `freshCreate:` is also reached via the dead-forwarder
+	// eviction above — a stale cache entry must end up here so the
+	// caller gets a working Forwarder, not just an absent one.
+freshCreate:
 	r.byRoute[key] = &routeEntry{inFlight: true}
 	r.mu.Unlock()
 
 	fwd, err := r.createForwarder(ctx, &app, ns)
 	r.mu.Lock()
 	entry := r.byRoute[key]
+	if r.log != nil && err == nil {
+		r.log.Info("ingress lookup fresh forwarder", "app_id", appID, "ns", ns, "port", fwd.LocalPort())
+	}
 	if err != nil {
 		// Remove the failed slot so a retry can try again; cache the
 		// error on a fresh entry so concurrent waiters see it.
@@ -267,6 +305,73 @@ func (r *Router) Close() {
 		if e.fwd != nil {
 			_ = e.fwd.Stop()
 		}
+	}
+}
+
+// Evict stops the Forwarder for (appID, namespace) and removes it from
+// the cache. Idempotent: a no-op when no Forwarder exists for the
+// route.
+//
+// Why this exists: when the user deletes a deployment (or the whole
+// application) the k8s Service backing the live app is torn down. The
+// kubectl port-forward subprocess for that route is now pointing at a
+// dead Service — dialing it returns "connection refused", and even if
+// the subprocess is still alive the URL we'd hand back to the browser
+// is misleading (it points at the old deployment, not whatever the
+// user redeploys next). Evicting from the cache forces the next
+// `GET /api/applications/{id}/ingress` to start a fresh Forwarder
+// against whatever Service exists in the cluster at that moment.
+//
+// `appID` matches the route key directly. `namespace` is the k8s
+// namespace string (DNS-1123); we use it as-is for the cache key
+// rather than re-resolving through the storage layer, because by the
+// time Evict runs the namespace row in SQLite is still authoritative.
+//
+// Callers: application.Service.Delete and application.Service.DeleteDeployment,
+// via the IngressEvicter interface (see application/cleaner.go).
+func (r *Router) Evict(appID int64, namespace string) {
+	key := routeKey{appID: appID, ns: namespace}
+	r.mu.Lock()
+	entry, ok := r.byRoute[key]
+	if ok {
+		delete(r.byRoute, key)
+	}
+	r.mu.Unlock()
+	if r.log != nil {
+		r.log.Info("ingress evict", "app_id", appID, "ns", namespace, "had_entry", ok)
+	}
+	if !ok || entry.fwd == nil {
+		return
+	}
+	// Stop blocks until the kubectl subprocess has exited, so the
+	// port is free by the time we return. The Forwarder's lastErr
+	// is left in place — it will be cleared on the next successful
+	// Start.
+	_ = entry.fwd.Stop()
+}
+
+// EvictApp stops the Forwarder for every cached route of the given
+// application. Used when the whole application is deleted (every
+// namespace's Service gets torn down in one shot). Idempotent.
+func (r *Router) EvictApp(appID int64) {
+	r.mu.Lock()
+	keys := make([]routeKey, 0, len(r.byRoute))
+	fwds := make([]*Forwarder, 0, len(r.byRoute))
+	for k, e := range r.byRoute {
+		if k.appID != appID {
+			continue
+		}
+		keys = append(keys, k)
+		if e.fwd != nil {
+			fwds = append(fwds, e.fwd)
+		}
+	}
+	for _, k := range keys {
+		delete(r.byRoute, k)
+	}
+	r.mu.Unlock()
+	for _, f := range fwds {
+		_ = f.Stop()
 	}
 }
 

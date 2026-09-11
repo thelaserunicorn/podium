@@ -207,7 +207,12 @@ export function K8sOverview({ appId, namespace, onPodsChange }: K8sOverviewProps
         </div>
         <div>
           <span className="text-muted-foreground">Deployment:</span>{" "}
-          <span className="font-mono">{state.deployment_name}</span>
+          {/* state.deployment_name is the backend's "live deployment
+              exists" signal (only populated when CurrentReplicas
+              succeeds — see backend/internal/api/kubernetes.go). Show
+              a dash instead of an empty string when there is no live
+              deployment so the panel doesn't render a blank cell. */}
+          <span className="font-mono">{state.deployment_name || "—"}</span>
         </div>
         <div>
           <span className="text-muted-foreground">Replicas:</span>{" "}
