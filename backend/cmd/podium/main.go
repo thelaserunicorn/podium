@@ -118,6 +118,10 @@ func run() error {
 	api.MountAuth(mux, auth.NewHandler(authSvc))
 	api.MountApplications(mux, application.NewHandler(appSvc))
 	api.NewDeploymentHandler(queries, appSvc, orch, logger).Mount(mux)
+	// Templates tab: catalog + "use" endpoint. The handler shares the
+	// orchestrator so a template-spawned application can trigger its
+	// first deploy in the same round-trip.
+	api.NewTemplatesHandler(appSvc, queries, orch, logger).Mount(mux)
 	api.NewAdminHandler(authSvc).Mount(mux)
 	if k8sClient != nil {
 		api.NewK8sHandler(queries, appSvc, k8sClient, logger).Mount(mux)
