@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
-import { Layers, Pencil, Plus, Trash2 } from "lucide-react";
+import { Layers, Pencil, Plus, Search, Trash2, X } from "lucide-react";
 import { api } from "@/lib/api";
 import { cn } from "@/lib/utils";
 import { Button } from "@/components/ui/button";
@@ -69,6 +69,10 @@ export function AppListPage() {
   // behavior so a returning user sees everything until they opt in
   // to a filter.
   const [filter, setFilter] = useState<StatusFilter>("all");
+  // Free-text search over name + repo URL. Empty string disables
+  // the search filter; trimming happens at compare-time so leading /
+  // trailing whitespace in the input doesn't hide matches.
+  const [query, setQuery] = useState("");
 
   async function load() {
     try {
@@ -83,16 +87,10 @@ export function AppListPage() {
     void load();
   }, []);
 
-  // Derive per-bucket counts and the filtered list in a single pass.
-  // Counting everything first means the chip group can show "Running · 3"
-  // etc. — users see what's in each bucket before clicking, which is
-  // a much better UX than clicking a filter and getting an empty grid.
-  // An app with latest_status.status === "RUNNING" goes in "running";
-  // the four QUEUED/BUILDING/DEPLOYING/STARTING states (plus BUILT)
-  // collapse into "in_flight" because from the operator's perspective
-  // they're all "this is mid-deploy"; FAILED is its own bucket so a
-  // broken deploy stays visible until the user re-deploys; apps with
-  // no latest_status go in "never_deployed".
+  // Per-bucket counts come from the full app list so the chip group
+  // always shows "what's available" — chip counts don't change as the
+  // user types in the search box, only the visible grid does. The
+  // visible list applies both the status filter AND the search query.
   const { counts, visible } = useMemo(() => {
     const c = {
       all: 0,
@@ -102,14 +100,18 @@ export function AppListPage() {
       never_deployed: 0,
     } satisfies Record<StatusFilter, number>;
     const v: Application[] = [];
+    const q = query.trim().toLowerCase();
     for (const a of apps ?? []) {
       c.all++;
       const bucket = bucketFor(a);
       c[bucket]++;
-      if (bucket === filter || filter === "all") v.push(a);
+      const inBucket = bucket === filter || filter === "all";
+      const matchesQuery =
+        q === "" || a.name.toLowerCase().includes(q) || a.repository_url.toLowerCase().includes(q);
+      if (inBucket && matchesQuery) v.push(a);
     }
     return { counts: c, visible: v };
-  }, [apps, filter]);
+  }, [apps, filter, query]);
 
   async function deleteApp(a: Application) {
     // App delete tears down the k8s resources for every namespace the
@@ -209,78 +211,121 @@ export function AppListPage() {
           {apps && apps.length > 0 && (
             <>
               {/*
-                Filter chip group. Sits inside the card body, above the
-                grid, so the chips are visually attached to the list they
-                filter. Each chip shows its bucket label + count; the
-                active chip is filled with the primary brand color and
-                a subtle ring, the inactive chips are outlined so the
-                active state is unambiguous at a glance.
-
-                We hide a chip when its count is 0 to keep the row
-                focused on buckets the user can actually click into —
-                "Failed · 0" is misleading (it suggests there were
-                failed deploys once) and adds visual noise.
+                Search input + filter chip group on one row. The search
+                box grows to fill the row so a long query doesn't push
+                the chips off-screen; the chips wrap below it on narrow
+                viewports. Search is a substring match over name +
+                repository URL (case-insensitive).
               */}
-              <div
-                role="group"
-                aria-label="Filter applications by status"
-                className="mb-4 flex flex-wrap items-center gap-2"
-              >
-                <FilterChip
-                  active={filter === "all"}
-                  label="All"
-                  count={counts.all}
-                  onClick={() => setFilter("all")}
-                />
-                {counts.running > 0 && (
-                  <FilterChip
-                    active={filter === "running"}
-                    label="Running"
-                    count={counts.running}
-                    tone="running"
-                    onClick={() => setFilter("running")}
+              <div className="mb-4 flex flex-col gap-3 md:flex-row md:items-center md:justify-between">
+                <div className="relative w-full md:max-w-sm">
+                  <Search
+                    className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground"
+                    aria-hidden="true"
                   />
-                )}
-                {counts.in_flight > 0 && (
-                  <FilterChip
-                    active={filter === "in_flight"}
-                    label="In flight"
-                    count={counts.in_flight}
-                    tone="in_flight"
-                    onClick={() => setFilter("in_flight")}
+                  <Input
+                    type="search"
+                    value={query}
+                    onChange={(e) => setQuery(e.target.value)}
+                    placeholder="Search by name or repository URL"
+                    aria-label="Search applications"
+                    className="pl-8 pr-8"
                   />
-                )}
-                {counts.failed > 0 && (
+                  {query !== "" && (
+                    <button
+                      type="button"
+                      onClick={() => setQuery("")}
+                      aria-label="Clear search"
+                      className="absolute right-2 top-1/2 -translate-y-1/2 rounded p-0.5 text-muted-foreground hover:text-foreground"
+                    >
+                      <X className="h-3.5 w-3.5" />
+                    </button>
+                  )}
+                </div>
+
+                {/*
+                  Filter chip group. Each chip shows its bucket label +
+                  count; the active chip is filled with the primary brand
+                  color and a subtle ring, the inactive chips are outlined
+                  so the active state is unambiguous at a glance.
+
+                  We hide a chip when its count is 0 to keep the row
+                  focused on buckets the user can actually click into —
+                  "Failed · 0" is misleading (it suggests there were
+                  failed deploys once) and adds visual noise.
+                */}
+                <div
+                  role="group"
+                  aria-label="Filter applications by status"
+                  className="flex flex-wrap items-center gap-2"
+                >
                   <FilterChip
-                    active={filter === "failed"}
-                    label="Failed"
-                    count={counts.failed}
-                    tone="failed"
-                    onClick={() => setFilter("failed")}
+                    active={filter === "all"}
+                    label="All"
+                    count={counts.all}
+                    onClick={() => setFilter("all")}
                   />
-                )}
-                {counts.never_deployed > 0 && (
-                  <FilterChip
-                    active={filter === "never_deployed"}
-                    label="Never deployed"
-                    count={counts.never_deployed}
-                    onClick={() => setFilter("never_deployed")}
-                  />
-                )}
+                  {counts.running > 0 && (
+                    <FilterChip
+                      active={filter === "running"}
+                      label="Running"
+                      count={counts.running}
+                      tone="running"
+                      onClick={() => setFilter("running")}
+                    />
+                  )}
+                  {counts.in_flight > 0 && (
+                    <FilterChip
+                      active={filter === "in_flight"}
+                      label="In flight"
+                      count={counts.in_flight}
+                      tone="in_flight"
+                      onClick={() => setFilter("in_flight")}
+                    />
+                  )}
+                  {counts.failed > 0 && (
+                    <FilterChip
+                      active={filter === "failed"}
+                      label="Failed"
+                      count={counts.failed}
+                      tone="failed"
+                      onClick={() => setFilter("failed")}
+                    />
+                  )}
+                  {counts.never_deployed > 0 && (
+                    <FilterChip
+                      active={filter === "never_deployed"}
+                      label="Never deployed"
+                      count={counts.never_deployed}
+                      onClick={() => setFilter("never_deployed")}
+                    />
+                  )}
+                </div>
               </div>
 
               {visible.length === 0 ? (
                 // Filter-specific empty state. Differs from the "no apps
                 // at all" empty state above: there ARE apps, the user
-                // just filtered them all out. The reset link is the
-                // natural escape hatch.
+                // just filtered or searched them all out. The reset
+                // actions depend on which filter is active — when the
+                // search box is the cause, clearing it is the natural
+                // escape hatch.
                 <div className="flex flex-col items-center justify-center gap-2 rounded-md border border-dashed border-border p-8 text-center">
                   <p className="text-sm text-muted-foreground">
-                    No applications match this filter.
+                    No applications match {query.trim() !== "" ? "this search" : "this filter"}.
                   </p>
-                  <Button variant="outline" size="sm" onClick={() => setFilter("all")}>
-                    Show all
-                  </Button>
+                  <div className="flex gap-2">
+                    {query.trim() !== "" && (
+                      <Button variant="outline" size="sm" onClick={() => setQuery("")}>
+                        Clear search
+                      </Button>
+                    )}
+                    {filter !== "all" && (
+                      <Button variant="outline" size="sm" onClick={() => setFilter("all")}>
+                        Show all
+                      </Button>
+                    )}
+                  </div>
                 </div>
               ) : (
                 <div className="grid grid-cols-1 gap-4 md:grid-cols-2 lg:grid-cols-3">
