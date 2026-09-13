@@ -37,7 +37,7 @@ export function SignupPage() {
   return (
     <div className="flex min-h-screen flex-col items-center justify-center gap-6 bg-muted p-4">
       {/* Brand mark above the auth card (see LoginPage for rationale). */}
-      <img src="/logo.png" alt="Podium" className="h-10 w-auto max-w-sm object-contain" />
+      <img src="/logo.png" alt="Podium" className="h-16 w-auto max-w-sm object-contain" />
       <Card className="w-full max-w-sm">
         <CardHeader>
           <CardTitle>Create an account</CardTitle>
