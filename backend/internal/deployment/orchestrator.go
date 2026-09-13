@@ -13,8 +13,10 @@ package deployment
 
 import (
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -108,6 +110,84 @@ var ErrDeployFailed = errors.New("deploy failed")
 // returns errors that errors.Is-match this sentinel when readyReplicas
 // never reaches desiredReplicas within Timeouts.Readiness.
 var ErrReadinessTimeout = errors.New("readiness timeout")
+
+// ErrActiveDeployment is returned by Queue when the (app, namespace)
+// pair already has a deployment in a non-terminal state. The API
+// layer surfaces this as 409 Conflict (DECISIONS.md B — no queueing,
+// no parallel builds per app).
+var ErrActiveDeployment = errors.New("deployment already in progress for this app+namespace")
+
+// QueueInput captures the inputs that Queue needs from the caller.
+// `Namespace` is the user-facing namespace string; Queue resolves it
+// to an environment id internally.
+type QueueInput struct {
+	App       *application.Application
+	Namespace string
+	Replicas  int
+}
+
+// Queue creates a fresh deployment row for (app, namespace) and kicks
+// off the orchestrator goroutine. It is the shared pre-flight used
+// by both the manual "Deploy" action and the templates tab's
+// "create + first deploy" flow — keeping both call sites on the
+// same validation, version bump, and 409 semantics. The returned
+// deployment is the row Queue just inserted; status is QUEUED at
+// return time. The goroutine progresses it asynchronously.
+//
+// Returns ErrActiveDeployment when another deployment for the same
+// (app, namespace) pair is in flight.
+func (o *Orchestrator) Queue(ctx context.Context, in QueueInput) (*storage.Deployment, error) {
+	if in.App == nil {
+		return nil, fmt.Errorf("deployment: Queue: nil app")
+	}
+	if err := application.ValidateNamespaceName(in.Namespace); err != nil {
+		return nil, err
+	}
+
+	envID, err := o.store.EnvironmentIDByNamespace(ctx, in.Namespace)
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return nil, fmt.Errorf("deployment: lookup environment: %w", err)
+	}
+	if errors.Is(err, sql.ErrNoRows) {
+		envID, err = o.store.EnsureEnvironment(ctx, in.Namespace)
+		if err != nil {
+			return nil, fmt.Errorf("deployment: create environment: %w", err)
+		}
+	}
+
+	active, err := o.store.HasActiveDeployment(ctx, in.App.ID, envID)
+	if err != nil {
+		return nil, fmt.Errorf("deployment: check active: %w", err)
+	}
+	if active {
+		return nil, ErrActiveDeployment
+	}
+
+	version, err := o.store.ApplicationNextVersion(ctx, in.App.ID)
+	if err != nil {
+		return nil, fmt.Errorf("deployment: bump version: %w", err)
+	}
+	image := fmt.Sprintf("%s:v%d", in.App.Name, version)
+	deploymentID, err := o.store.CreateDeployment(ctx, in.App.ID, envID, version, in.Replicas, image)
+	if err != nil {
+		return nil, fmt.Errorf("deployment: create row: %w", err)
+	}
+
+	go func() {
+		runCtx, cancel := context.WithTimeout(context.Background(), 30*time.Minute)
+		defer cancel()
+		if err := o.Run(runCtx, deploymentID, in.App.ID, in.App.Name, in.App.RepositoryURL, envID, in.Replicas); err != nil {
+			slog.Default().Info("queue deployment finished with error",
+				"deployment_id", deploymentID, "err", err)
+		}
+	}()
+
+	d, err := o.store.GetDeployment(context.Background(), deploymentID)
+	if err != nil {
+		return nil, fmt.Errorf("deployment: read row: %w", err)
+	}
+	return d, nil
+}
 
 // SourceDir returns the path where this orchestrator would clone the
 // given app's source. Exposed so tests can assert on layout.

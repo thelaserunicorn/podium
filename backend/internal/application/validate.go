@@ -64,3 +64,15 @@ func ValidatePort(p int) error {
 	}
 	return nil
 }
+
+// ValidateReplicas accepts 1..5. The MVP deployment slider (spec.md §19)
+// exposes 1..5; the limit exists to keep a single dev cluster from
+// being overwhelmed by a misclick. Replicas==0 (scale-to-zero) is
+// not exposed through this entry point; DECISIONS.md B treats it
+// specially via the k8s applier.
+func ValidateReplicas(n int) error {
+	if n < 1 || n > 5 {
+		return ErrInvalidReplicas
+	}
+	return nil
+}

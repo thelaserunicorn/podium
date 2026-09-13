@@ -1,5 +1,13 @@
 import { Link, NavLink, Outlet, useLocation } from "react-router-dom";
-import { LayoutDashboard, Layers, ShieldCheck, LogOut, FileCode2, Boxes } from "lucide-react";
+import {
+  LayoutDashboard,
+  Layers,
+  ShieldCheck,
+  LogOut,
+  FileCode2,
+  Boxes,
+  Sparkles,
+} from "lucide-react";
 import { useAuth } from "@/lib/auth";
 import { Button } from "@/components/ui/button";
 import { ThemeToggle } from "@/components/ThemeToggle";
@@ -30,6 +38,9 @@ export function Layout() {
           </SidebarLink>
           <SidebarLink to="/namespaces" icon={<Boxes className="h-4 w-4" />}>
             Namespaces
+          </SidebarLink>
+          <SidebarLink to="/templates" icon={<Sparkles className="h-4 w-4" />}>
+            Templates
           </SidebarLink>
           <SidebarLink to="/yaml-generator" icon={<FileCode2 className="h-4 w-4" />}>
             YAML generator
@@ -108,6 +119,7 @@ function labelFor(pathname: string): React.ReactNode {
   if (pathname.startsWith("/yaml-generator"))
     return <Link to="/yaml-generator">YAML generator</Link>;
   if (pathname.startsWith("/namespaces")) return <Link to="/namespaces">Namespaces</Link>;
+  if (pathname.startsWith("/templates")) return <Link to="/templates">Templates</Link>;
   if (pathname.startsWith("/apps/new")) return <Link to="/apps/new">New application</Link>;
   if (pathname.startsWith("/apps/")) return <Link to="/apps">Applications</Link>;
   if (pathname.startsWith("/apps")) return <Link to="/apps">Applications</Link>;

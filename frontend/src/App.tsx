@@ -11,6 +11,7 @@ import { LoginPage } from "./routes/LoginPage";
 import { NamespacesPage } from "./routes/NamespacesPage";
 import { NewAppPage } from "./routes/NewAppPage";
 import { SignupPage } from "./routes/SignupPage";
+import { TemplatesPage } from "./routes/TemplatesPage";
 import { YamlGeneratorPage } from "./routes/YamlGeneratorPage";
 import { RequireAdmin, RequireAuth } from "./routes/guards";
 
@@ -36,6 +37,7 @@ export default function App() {
               <Route path="/apps/new" element={<NewAppPage />} />
               <Route path="/apps/:id" element={<AppDetailPage />} />
               <Route path="/namespaces" element={<NamespacesPage />} />
+              <Route path="/templates" element={<TemplatesPage />} />
               <Route path="/yaml-generator" element={<YamlGeneratorPage />} />
               <Route element={<RequireAdmin />}>
                 <Route path="/admin/users" element={<AdminUsersPage />} />
