@@ -3,6 +3,7 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -24,6 +25,16 @@ const (
 )
 
 // Deployment is a single row from the `deployments` table.
+//
+// MarshalJSON is implemented manually so the json:"...,omitempty" tags
+// actually mean what they say. The default Go JSON encoder marshals
+// sql.NullString as `{"String": "...", "Valid": true}` regardless of
+// the struct tag, which then trips the React frontend (React error
+// #31: "Objects are not valid as a React child (found: object with
+// keys {String, Valid})") when a failed deploy tries to render the
+// reason as text. Same hazard for sql.NullTime. The marshaller below
+// flattens those to plain *string / *time.Time so the wire shape
+// matches the frontend's TypeScript interfaces.
 type Deployment struct {
 	ID            int64            `json:"id"`
 	ApplicationID int64            `json:"application_id"`
@@ -32,11 +43,63 @@ type Deployment struct {
 	Image         string           `json:"image"`
 	Replicas      int              `json:"replicas"`
 	Status        DeploymentStatus `json:"status"`
-	Reason        sql.NullString   `json:"reason,omitempty"`
+	Reason        sql.NullString   `json:"-"` // flattened by MarshalJSON
 	CreatedAt     time.Time        `json:"created_at"`
-	StartedAt     sql.NullTime     `json:"started_at,omitempty"`
-	FinishedAt    sql.NullTime     `json:"finished_at,omitempty"`
-	DeletedAt     sql.NullTime     `json:"deleted_at,omitempty"`
+	StartedAt     sql.NullTime     `json:"-"` // flattened by MarshalJSON
+	FinishedAt    sql.NullTime     `json:"-"` // flattened by MarshalJSON
+	DeletedAt     sql.NullTime     `json:"-"` // flattened by MarshalJSON
+}
+
+// deploymentJSON is the on-the-wire shape. Kept private — callers
+// don't need to know; they just receive the marshalled bytes.
+type deploymentJSON struct {
+	ID            int64            `json:"id"`
+	ApplicationID int64            `json:"application_id"`
+	EnvironmentID int64            `json:"environment_id"`
+	Version       int              `json:"version"`
+	Image         string           `json:"image"`
+	Replicas      int              `json:"replicas"`
+	Status        DeploymentStatus `json:"status"`
+	Reason        *string          `json:"reason,omitempty"`
+	CreatedAt     time.Time        `json:"created_at"`
+	StartedAt     *time.Time       `json:"started_at,omitempty"`
+	FinishedAt    *time.Time       `json:"finished_at,omitempty"`
+	DeletedAt     *time.Time       `json:"deleted_at,omitempty"`
+}
+
+// MarshalJSON renders a Deployment with nullable fields flattened to
+// `*string` / `*time.Time`. When the column is SQL NULL (Valid=false)
+// the pointer is nil and the field is omitted from the response,
+// matching the `omitempty` semantics the original struct tags were
+// trying to express.
+func (d Deployment) MarshalJSON() ([]byte, error) {
+	out := deploymentJSON{
+		ID:            d.ID,
+		ApplicationID: d.ApplicationID,
+		EnvironmentID: d.EnvironmentID,
+		Version:       d.Version,
+		Image:         d.Image,
+		Replicas:      d.Replicas,
+		Status:        d.Status,
+		CreatedAt:     d.CreatedAt,
+	}
+	if d.Reason.Valid {
+		s := d.Reason.String
+		out.Reason = &s
+	}
+	if d.StartedAt.Valid {
+		t := d.StartedAt.Time
+		out.StartedAt = &t
+	}
+	if d.FinishedAt.Valid {
+		t := d.FinishedAt.Time
+		out.FinishedAt = &t
+	}
+	if d.DeletedAt.Valid {
+		t := d.DeletedAt.Time
+		out.DeletedAt = &t
+	}
+	return json.Marshal(out)
 }
 
 // LogLine is one row from deploy_log_lines. Returned to the UI for

@@ -3,8 +3,10 @@ package storage
 import (
 	"context"
 	"database/sql"
+	"encoding/json"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -110,6 +112,67 @@ func TestSetDeploymentStatus_SetsFinishedAtOnTerminal(t *testing.T) {
 	}
 	if !d.Reason.Valid || d.Reason.String != "build_failed" {
 		t.Errorf("reason=%v", d.Reason)
+	}
+}
+
+// TestDeploymentMarshalJSON_FlattensNullableFields guards the wire
+// shape that the React frontend depends on. When a deployment row
+// has Reason / StartedAt / FinishedAt populated, the JSON must use
+// plain string / RFC3339 values, not the sql.NullString /
+// sql.NullTime object shapes ({String,Valid} / {Time,Valid}).
+//
+// Otherwise the React frontend hits error #31 ("Objects are not
+// valid as a React child") the moment it tries to render the
+// reason of a FAILED deployment as text.
+func TestDeploymentMarshalJSON_FlattensNullableFields(t *testing.T) {
+	q := newTestQueries(t)
+	_, appID, envID := seedUserAppEnv(t, q)
+	ctx := context.Background()
+	id, _ := q.CreateDeployment(ctx, appID, envID, 1, 3, "my-api:v1")
+
+	if err := q.SetDeploymentStatus(ctx, id, StatusFailed, "build_failed"); err != nil {
+		t.Fatal(err)
+	}
+	d, err := q.GetDeployment(ctx, id)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	raw, err := json.Marshal(&d)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+
+	// Round-trip into a generic map so we assert against the wire
+	// shape, not against the Go struct.
+	var got map[string]any
+	if err := json.Unmarshal(raw, &got); err != nil {
+		t.Fatalf("unmarshal: %v", err)
+	}
+
+	// reason must be a plain string, not an object.
+	if reason, ok := got["reason"].(string); !ok {
+		t.Errorf("reason should be a string on the wire, got %T (raw=%s)", got["reason"], raw)
+	} else if reason != "build_failed" {
+		t.Errorf("reason=%q want %q", reason, "build_failed")
+	}
+
+	// started_at and finished_at must be strings (or absent) — never
+	// objects with a Time/Valid pair.
+	for _, field := range []string{"started_at", "finished_at"} {
+		v, present := got[field]
+		if !present {
+			continue
+		}
+		if _, isObj := v.(map[string]any); isObj {
+			t.Errorf("%s should not be an object on the wire: %v", field, v)
+		}
+	}
+
+	// Sanity: the raw bytes must NOT contain the literal "Valid" key
+	// that sql.NullString / sql.NullTime emit.
+	if strings.Contains(string(raw), `"Valid"`) {
+		t.Errorf("raw JSON contains %q — nullable fields not flattened: %s", "Valid", raw)
 	}
 }
 
