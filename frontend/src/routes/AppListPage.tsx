@@ -36,6 +36,10 @@ interface Application {
   container_port: number;
   version: number;
   updated_at: string;
+  // owner_username is only populated for admin viewers (the backend
+  // joins on users only when the caller is an admin). Regular users
+  // never see this field.
+  owner_username?: string;
   // Backend's GET /api/applications may include latest_status
   // depending on the join path; we tolerate either form.
   latest_status?: LatestStatus | null;
@@ -638,6 +642,15 @@ function AppCard({
           </h3>
           <span className="shrink-0 font-mono text-xs text-muted-foreground">v{a.version}</span>
         </div>
+        {a.owner_username && (
+          // Only rendered for admin viewers (the field is omitted for
+          // regular users). The chip sits next to the repo URL so it
+          // reads like "alice-7 · github.com/..." — a single glance
+          // tells the admin which user owns the row.
+          <p className="mt-1 text-xs text-muted-foreground" title={`owned by ${a.owner_username}`}>
+            <span className="font-mono">@{a.owner_username}</span>
+          </p>
+        )}
         <p className="mt-1 truncate text-xs text-muted-foreground" title={a.repository_url}>
           {a.repository_url}
         </p>

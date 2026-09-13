@@ -28,6 +28,13 @@ type DeploymentHandler struct {
 	logger *slog.Logger
 }
 
+// caller builds the application.Caller from the request's session user.
+// Centralised here so every sub-resource lookup in this file picks up
+// admin scope from one place.
+func caller(user *auth.User) application.Caller {
+	return application.Caller{UserID: user.ID, IsAdmin: user.Role == auth.RoleAdmin}
+}
+
 // NewDeploymentHandler wires the dependencies. The handler does not
 // start any goroutines itself — the orchestrator manages lifecycle.
 func NewDeploymentHandler(store *storage.Queries, apps *application.Service, orch *deployment.Orchestrator, logger *slog.Logger) *DeploymentHandler {
@@ -86,7 +93,7 @@ func (h *DeploymentHandler) Deploy(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	app, err := h.apps.Get(r.Context(), appID, user.ID)
+	app, err := h.apps.GetForCaller(r.Context(), appID, caller(user))
 	if err != nil {
 		if errors.Is(err, application.ErrNotFound) {
 			writeJSONError(w, http.StatusNotFound, "application not found")
@@ -215,7 +222,7 @@ func (h *DeploymentHandler) GetDeployment(w http.ResponseWriter, r *http.Request
 		return
 	}
 	// Authorize: deployment belongs to one of the caller's apps.
-	app, err := h.apps.Get(r.Context(), d.ApplicationID, user.ID)
+	app, err := h.apps.GetForCaller(r.Context(), d.ApplicationID, caller(user))
 	if err != nil {
 		writeJSONError(w, http.StatusNotFound, "deployment not found")
 		return
@@ -249,7 +256,7 @@ func (h *DeploymentHandler) DeleteDeployment(w http.ResponseWriter, r *http.Requ
 		writeJSONError(w, http.StatusBadRequest, "invalid id")
 		return
 	}
-	if err := h.apps.DeleteDeployment(r.Context(), id, user.ID); err != nil {
+	if err := h.apps.DeleteDeploymentForCaller(r.Context(), id, caller(user)); err != nil {
 		if errors.Is(err, application.ErrNotFound) {
 			writeJSONError(w, http.StatusNotFound, "deployment not found")
 			return
@@ -288,7 +295,7 @@ func (h *DeploymentHandler) Scale(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid application id")
 		return
 	}
-	app, err := h.apps.Get(r.Context(), appID, user.ID)
+	app, err := h.apps.GetForCaller(r.Context(), appID, caller(user))
 	if err != nil {
 		if errors.Is(err, application.ErrNotFound) {
 			writeJSONError(w, http.StatusNotFound, "application not found")
@@ -360,7 +367,7 @@ func (h *DeploymentHandler) Restart(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid application id")
 		return
 	}
-	app, err := h.apps.Get(r.Context(), appID, user.ID)
+	app, err := h.apps.GetForCaller(r.Context(), appID, caller(user))
 	if err != nil {
 		if errors.Is(err, application.ErrNotFound) {
 			writeJSONError(w, http.StatusNotFound, "application not found")
@@ -444,7 +451,7 @@ func (h *DeploymentHandler) Rollback(w http.ResponseWriter, r *http.Request) {
 	// Authorize: deployment belongs to one of the caller's apps. We
 	// never leak existence (AGENTS.md §19) — a wrong-owner lookup
 	// surfaces as 404 too.
-	app, err := h.apps.Get(r.Context(), d.ApplicationID, user.ID)
+	app, err := h.apps.GetForCaller(r.Context(), d.ApplicationID, caller(user))
 	if err != nil {
 		writeJSONError(w, http.StatusNotFound, "deployment not found")
 		return
@@ -514,7 +521,7 @@ func (h *DeploymentHandler) ListDeployments(w http.ResponseWriter, r *http.Reque
 		writeJSONError(w, http.StatusBadRequest, "invalid application id")
 		return
 	}
-	if _, err := h.apps.Get(r.Context(), appID, user.ID); err != nil {
+	if _, err := h.apps.GetForCaller(r.Context(), appID, caller(user)); err != nil {
 		if errors.Is(err, application.ErrNotFound) {
 			writeJSONError(w, http.StatusNotFound, "application not found")
 			return
@@ -563,7 +570,7 @@ func (h *DeploymentHandler) GetLogs(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusNotFound, "deployment not found")
 		return
 	}
-	if _, err := h.apps.Get(r.Context(), d.ApplicationID, user.ID); err != nil {
+	if _, err := h.apps.GetForCaller(r.Context(), d.ApplicationID, caller(user)); err != nil {
 		writeJSONError(w, http.StatusNotFound, "deployment not found")
 		return
 	}

@@ -276,13 +276,13 @@ func TestApplicationCreateAndList(t *testing.T) {
 		t.Fatalf("list body missing applications field: %s", body)
 	}
 
-	// Admin's list does NOT contain alice's app (ownership isolation).
+	// Admin's list DOES contain alice's app — admins see every user's apps.
 	resp, body = httpJSON(t, "GET", env.server.URL+"/api/applications", nil, authHeader(env.adminTok))
 	if resp.StatusCode != 200 {
 		t.Fatalf("admin list status: %d body=%s", resp.StatusCode, body)
 	}
-	if strings.Contains(string(body), fmt.Sprintf(`"id":%d`, created.Application.ID)) {
-		t.Fatalf("admin saw alice's app in their list: %s", body)
+	if !strings.Contains(string(body), fmt.Sprintf(`"id":%d`, created.Application.ID)) {
+		t.Fatalf("admin did not see alice's app in their list: %s", body)
 	}
 }
 
@@ -392,10 +392,176 @@ func TestApplicationCrossUserAccessReturnsNotFound(t *testing.T) {
 	}
 	_ = json.Unmarshal(body, &created)
 
-	// Admin hits alice's app with a different user_id — gets 404.
+	// Admin can read alice's app — admins see every user's apps.
 	resp, body = httpJSON(t, "GET", fmt.Sprintf("%s/api/applications/%d", env.server.URL, created.Application.ID), nil, authHeader(env.adminTok))
+	if resp.StatusCode != 200 {
+		t.Fatalf("admin could not read alice's app: status %d body=%s", resp.StatusCode, body)
+	}
+}
+
+// TestAdminListReturnsOwnerUsername: when an admin lists applications,
+// every row must carry owner_username (sourced from the JOIN against
+// users) so the Applications tab can label each row.
+func TestAdminListReturnsOwnerUsername(t *testing.T) {
+	t.Parallel()
+	env := newTestEnv(t)
+
+	create := map[string]any{
+		"name":           fmt.Sprintf("owned-%d", uniqueUnix()),
+		"repository_url": "https://github.com/x/y",
+		"container_port": 80,
+	}
+	resp, body := httpJSON(t, "POST", env.server.URL+"/api/applications", create, authHeader(env.aliceTok))
+	if resp.StatusCode != 201 {
+		t.Fatalf("create: %d %s", resp.StatusCode, body)
+	}
+
+	resp, body = httpJSON(t, "GET", env.server.URL+"/api/applications", nil, authHeader(env.adminTok))
+	if resp.StatusCode != 200 {
+		t.Fatalf("admin list: %d %s", resp.StatusCode, body)
+	}
+	if !strings.Contains(string(body), `"owner_username":"alice`) {
+		t.Fatalf("admin list missing owner_username=alice-*: %s", body)
+	}
+
+	// Non-admin list must NOT carry owner_username (it's a privileged
+	// field — owners see only their own apps, who needs a label for
+	// themselves?). Verified via DTO json tag `omitempty`.
+	resp, body = httpJSON(t, "GET", env.server.URL+"/api/applications", nil, authHeader(env.aliceTok))
+	if resp.StatusCode != 200 {
+		t.Fatalf("alice list: %d %s", resp.StatusCode, body)
+	}
+	if strings.Contains(string(body), `"owner_username":`) {
+		t.Fatalf("alice list should not include owner_username: %s", body)
+	}
+}
+
+// TestAdminCanDeleteOtherUsersApp: the admin full-access contract —
+// an admin can DELETE an app owned by another user.
+func TestAdminCanDeleteOtherUsersApp(t *testing.T) {
+	t.Parallel()
+	env := newTestEnv(t)
+
+	create := map[string]any{
+		"name":           fmt.Sprintf("admin-del-%d", uniqueUnix()),
+		"repository_url": "https://github.com/x/y",
+		"container_port": 80,
+	}
+	resp, body := httpJSON(t, "POST", env.server.URL+"/api/applications", create, authHeader(env.aliceTok))
+	if resp.StatusCode != 201 {
+		t.Fatalf("create: %d %s", resp.StatusCode, body)
+	}
+	var created struct {
+		Application struct {
+			ID int64 `json:"id"`
+		} `json:"application"`
+	}
+	_ = json.Unmarshal(body, &created)
+
+	resp, body = httpJSON(t, "DELETE", fmt.Sprintf("%s/api/applications/%d", env.server.URL, created.Application.ID), nil, authHeader(env.adminTok))
+	if resp.StatusCode != 204 {
+		t.Fatalf("admin delete alice's app: %d %s", resp.StatusCode, body)
+	}
+
+	// Sanity: it's actually gone.
+	resp, _ = httpJSON(t, "GET", fmt.Sprintf("%s/api/applications/%d", env.server.URL, created.Application.ID), nil, authHeader(env.aliceTok))
 	if resp.StatusCode != 404 {
-		t.Fatalf("status: got %d, body=%s", resp.StatusCode, body)
+		t.Fatalf("alice still sees the app after admin deleted it: %d", resp.StatusCode)
+	}
+}
+
+// TestNonAdminStillBlockedOnCrossUser: guard against accidentally
+// widening non-admin access while implementing the admin feature.
+// A non-admin must still get 404 on another user's app id.
+func TestNonAdminStillBlockedOnCrossUser(t *testing.T) {
+	t.Parallel()
+	env := newTestEnv(t)
+
+	// Alice owns an app.
+	create := map[string]any{
+		"name":           fmt.Sprintf("bob-block-%d", uniqueUnix()),
+		"repository_url": "https://github.com/x/y",
+		"container_port": 80,
+	}
+	resp, body := httpJSON(t, "POST", env.server.URL+"/api/applications", create, authHeader(env.aliceTok))
+	if resp.StatusCode != 201 {
+		t.Fatalf("create: %d %s", resp.StatusCode, body)
+	}
+	var created struct {
+		Application struct {
+			ID int64 `json:"id"`
+		} `json:"application"`
+	}
+	_ = json.Unmarshal(body, &created)
+
+	// Sign up a second non-admin user, get them approved + logged in.
+	bobUsername := fmt.Sprintf("bob-%d", uniqueUnix())
+	bobSignup := map[string]any{
+		"username": bobUsername,
+		"email":    fmt.Sprintf("%s@x.test", bobUsername),
+		"password": "bobpassword123",
+	}
+	resp, body = httpJSON(t, "POST", env.server.URL+"/api/auth/signup", bobSignup, nil)
+	if resp.StatusCode != 201 {
+		t.Fatalf("bob signup: %d %s", resp.StatusCode, body)
+	}
+
+	// Look up bob's id via the admin users endpoint.
+	resp, body = httpJSON(t, "GET", env.server.URL+"/api/admin/users", nil, authHeader(env.adminTok))
+	if resp.StatusCode != 200 {
+		t.Fatalf("admin list users: %d %s", resp.StatusCode, body)
+	}
+	var wrap struct {
+		Users []struct {
+			ID       int64  `json:"id"`
+			Username string `json:"username"`
+		} `json:"users"`
+	}
+	_ = json.Unmarshal(body, &wrap)
+	var bobID int64
+	for _, u := range wrap.Users {
+		if u.Username == bobUsername {
+			bobID = u.ID
+			break
+		}
+	}
+	if bobID == 0 {
+		t.Fatalf("could not find bob id in admin users list: %s", body)
+	}
+
+	// Approve bob.
+	resp, body = httpJSON(t, "POST", fmt.Sprintf("%s/api/admin/users/%d/approve", env.server.URL, bobID), nil, authHeader(env.adminTok))
+	if resp.StatusCode != 200 {
+		t.Fatalf("approve bob: %d %s", resp.StatusCode, body)
+	}
+
+	// Bob logs in — the session token is in the Set-Cookie header,
+	// not the response body, so we have to read it off the response.
+	loginReq, _ := json.Marshal(map[string]any{"username": bobUsername, "password": "bobpassword123"})
+	loginResp, err := http.Post(env.server.URL+"/api/auth/login", "application/json", bytes.NewReader(loginReq))
+	if err != nil {
+		t.Fatalf("bob login: %v", err)
+	}
+	defer loginResp.Body.Close()
+	if loginResp.StatusCode != 200 {
+		body, _ := io.ReadAll(loginResp.Body)
+		t.Fatalf("bob login status: %d body=%s", loginResp.StatusCode, body)
+	}
+	var bobTok string
+	for _, c := range loginResp.Cookies() {
+		if c.Name == auth.SessionCookieName {
+			bobTok = c.Value
+			break
+		}
+	}
+	if bobTok == "" {
+		t.Fatalf("bob login: no session cookie in response")
+	}
+
+	// Bob hits alice's app → must be 404.
+	resp, body = httpJSON(t, "GET", fmt.Sprintf("%s/api/applications/%d", env.server.URL, created.Application.ID), nil, authHeader(bobTok))
+	if resp.StatusCode != 404 {
+		t.Fatalf("bob read alice's app: got %d want 404 body=%s", resp.StatusCode, body)
 	}
 }
 

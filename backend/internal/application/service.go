@@ -16,15 +16,29 @@ import (
 // table. The Version counter is the monotonic per-app counter from
 // DECISIONS.md D; it is bumped by Update and used by the deployment
 // orchestrator in M2 as the image tag suffix.
+//
+// OwnerUsername is populated only by the *ForCaller service methods so
+// admins can label rows on the Applications tab. The internal Get /
+// GetByID paths leave it empty.
 type Application struct {
 	ID            int64
 	UserID        int64
+	OwnerUsername string
 	Name          string
 	RepositoryURL string
 	ContainerPort int
 	Version       int
 	CreatedAt     time.Time
 	UpdatedAt     time.Time
+}
+
+// Caller identifies the authenticated principal making a request. IsAdmin
+// short-circuits the per-user ownership checks on the *ForCaller service
+// methods so admins can read / mutate any application. The plain
+// user-scoped Get/List/Update/Delete methods ignore it.
+type Caller struct {
+	UserID  int64
+	IsAdmin bool
 }
 
 // CreateInput is the validated input to Create. Name + RepositoryURL +
@@ -41,11 +55,16 @@ type CreateInput struct {
 // so 0 is always safe to ignore. Name=="" is the same sentinel for
 // "leave the name as-is" — ValidateName rejects the empty string, so
 // the empty value is always safe to ignore.
+//
+// IsAdmin lets an admin edit any user's application; when true the
+// per-row UPDATE skips the user_id predicate so the admin can mutate
+// apps they don't own.
 type UpdateInput struct {
 	Name          string
 	RepositoryURL string
 	ContainerPort int
 	UserID        int64
+	IsAdmin       bool
 }
 
 // Service is the public entry point for the application package.
@@ -223,6 +242,71 @@ func (s *Service) List(ctx context.Context, userID int64) ([]Application, error)
 	return out, rows.Err()
 }
 
+// ListForCaller is the admin-aware variant of List. Non-admin callers
+// see only their own apps (matching List's behaviour); admins see every
+// app across every user, with OwnerUsername populated from a JOIN so
+// the UI can label each row.
+//
+// Non-admins skip the JOIN — they only see their own rows so the
+// owner_username field would be a redundant self-reference. Keeping
+// it empty also lets the DTO omit the field via json:"...,omitempty".
+func (s *Service) ListForCaller(ctx context.Context, c Caller) ([]Application, error) {
+	if !c.IsAdmin {
+		return s.List(ctx, c.UserID)
+	}
+	const q = `
+		SELECT a.id, a.user_id, u.username,
+		       a.name, a.repository_url, a.container_port,
+		       a.version, a.created_at, a.updated_at
+		  FROM applications a
+		  JOIN users u ON u.id = a.user_id
+		 ORDER BY a.id
+	`
+	rows, err := s.db.QueryContext(ctx, q)
+	if err != nil {
+		return nil, fmt.Errorf("application: list: %w", err)
+	}
+	defer rows.Close()
+	var out []Application
+	for rows.Next() {
+		a, err := scanApplicationWithOwner(rows)
+		if err != nil {
+			return nil, fmt.Errorf("application: scan: %w", err)
+		}
+		out = append(out, a)
+	}
+	return out, rows.Err()
+}
+
+// GetForCaller is the admin-aware variant of Get. Cross-user access
+// from a non-admin still surfaces as ErrNotFound; an admin gets the app
+// regardless of ownership.
+//
+// Like ListForCaller, non-admins don't run the JOIN — they only ever
+// see their own apps, so OwnerUsername is left empty and the DTO omits
+// it.
+func (s *Service) GetForCaller(ctx context.Context, id int64, c Caller) (Application, error) {
+	if !c.IsAdmin {
+		return s.Get(ctx, id, c.UserID)
+	}
+	const q = `
+		SELECT a.id, a.user_id, u.username,
+		       a.name, a.repository_url, a.container_port,
+		       a.version, a.created_at, a.updated_at
+		  FROM applications a
+		  JOIN users u ON u.id = a.user_id
+		 WHERE a.id = ?
+	`
+	a, err := scanApplicationWithOwner(s.db.QueryRowContext(ctx, q, id))
+	if errors.Is(err, sql.ErrNoRows) {
+		return Application{}, ErrNotFound
+	}
+	if err != nil {
+		return Application{}, fmt.Errorf("application: select: %w", err)
+	}
+	return a, nil
+}
+
 // LatestStatuses returns a map[applicationID] -> LatestStatus for the
 // supplied app ids, used by the dashboard to render status badges.
 // Returns an empty map (and no error) when the service was constructed
@@ -242,6 +326,9 @@ func (s *Service) LatestStatuses(ctx context.Context, appIDs []int64) (map[int64
 // baked into Kubernetes Deployment / Service names (DECISIONS.md E),
 // so renaming a live app would orphan its cluster resources. URL and
 // port changes are always allowed regardless of deployment count.
+//
+// UpdateInput carries IsAdmin so an admin can edit any user's app; the
+// per-row UPDATE skips the user_id predicate when IsAdmin is true.
 func (s *Service) Update(ctx context.Context, id int64, in UpdateInput) (Application, error) {
 	if in.RepositoryURL != "" {
 		if err := ValidateRepositoryURL(in.RepositoryURL); err != nil {
@@ -259,7 +346,7 @@ func (s *Service) Update(ctx context.Context, id int64, in UpdateInput) (Applica
 		}
 	}
 
-	current, err := s.Get(ctx, id, in.UserID)
+	current, err := s.GetForCaller(ctx, id, Caller{UserID: in.UserID, IsAdmin: in.IsAdmin})
 	if err != nil {
 		return Application{}, err
 	}
@@ -290,16 +377,7 @@ func (s *Service) Update(ctx context.Context, id int64, in UpdateInput) (Applica
 		newPort = in.ContainerPort
 	}
 
-	res, err := s.db.ExecContext(ctx, `
-		UPDATE applications
-		   SET name           = ?,
-		       repository_url = ?,
-		       container_port = ?,
-		       version        = version + 1,
-		       updated_at     = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
-		 WHERE id = ?
-		   AND user_id = ?
-	`, newName, newURL, newPort, id, in.UserID)
+	res, err := s.UpdateExec(ctx, id, in.IsAdmin, newName, newURL, newPort, in.UserID)
 	if err != nil {
 		// SQLite enforces UNIQUE(user_id, name). On a rename that
 		// collides with another app the same user already owns we
@@ -316,7 +394,43 @@ func (s *Service) Update(ctx context.Context, id int64, in UpdateInput) (Applica
 	if n == 0 {
 		return Application{}, ErrNotFound
 	}
-	return s.Get(ctx, id, in.UserID)
+	return s.GetForCaller(ctx, id, Caller{UserID: in.UserID, IsAdmin: in.IsAdmin})
+}
+
+// UpdateExec runs the UPDATE statement with or without the user_id
+// predicate depending on IsAdmin. Extracted so the conditional WHERE
+// clause stays in one place.
+func (s *Service) UpdateExec(ctx context.Context, id int64, isAdmin bool, newName, newURL string, newPort int, userID int64) (sql.Result, error) {
+	if isAdmin {
+		return s.db.ExecContext(ctx, `
+			UPDATE applications
+			   SET name           = ?,
+			       repository_url = ?,
+			       container_port = ?,
+			       version        = version + 1,
+			       updated_at     = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+			 WHERE id = ?
+		`, newName, newURL, newPort, id)
+	}
+	return s.db.ExecContext(ctx, `
+		UPDATE applications
+		   SET name           = ?,
+		       repository_url = ?,
+		       container_port = ?,
+		       version        = version + 1,
+		       updated_at     = strftime('%Y-%m-%dT%H:%M:%fZ', 'now')
+		 WHERE id = ?
+		   AND user_id = ?
+	`, newName, newURL, newPort, id, userID)
+}
+
+// deleteExec runs the DELETE statement with or without the user_id
+// predicate depending on IsAdmin. Same shape as UpdateExec.
+func (s *Service) deleteExec(ctx context.Context, id int64, c Caller) (sql.Result, error) {
+	if c.IsAdmin {
+		return s.db.ExecContext(ctx, `DELETE FROM applications WHERE id = ?`, id)
+	}
+	return s.db.ExecContext(ctx, `DELETE FROM applications WHERE id = ? AND user_id = ?`, id, c.UserID)
 }
 
 // Delete removes the application and (via FK ON DELETE CASCADE) any related
@@ -335,10 +449,24 @@ func (s *Service) Update(ctx context.Context, id int64, in UpdateInput) (Applica
 // DELETE because the FK ON DELETE CASCADE removes the deployment +
 // env_var rows whose join produces that list.
 func (s *Service) Delete(ctx context.Context, id, userID int64) error {
+	// Plain user-scoped delete — kept for callers that already know the
+	// user owns the app (orchestrator, env.Delete). New admin-aware
+	// callers should use DeleteForCaller.
+	return s.deleteInternal(ctx, id, Caller{UserID: userID, IsAdmin: false})
+}
+
+// DeleteForCaller is the admin-aware variant of Delete. Admins can
+// delete any user's app; non-admins get ErrNotFound on cross-user ids,
+// same as before.
+func (s *Service) DeleteForCaller(ctx context.Context, id int64, c Caller) error {
+	return s.deleteInternal(ctx, id, c)
+}
+
+func (s *Service) deleteInternal(ctx context.Context, id int64, c Caller) error {
 	// Load first so we have the app (with Name + ID) to pass to the
 	// cleaner, AND so we can short-circuit with ErrNotFound for the
 	// "wrong owner" case before touching anything.
-	app, err := s.Get(ctx, id, userID)
+	app, err := s.GetForCaller(ctx, id, c)
 	if err != nil {
 		return err
 	}
@@ -370,9 +498,7 @@ func (s *Service) Delete(ctx context.Context, id, userID int64) error {
 		}
 	}
 
-	res, err := s.db.ExecContext(ctx, `
-		DELETE FROM applications WHERE id = ? AND user_id = ?
-	`, id, userID)
+	res, err := s.deleteExec(ctx, id, c)
 	if err != nil {
 		return fmt.Errorf("application: delete: %w", err)
 	}
@@ -442,6 +568,25 @@ func scanApplication(r rowScanner) (Application, error) {
 		updated string
 	)
 	if err := r.Scan(&a.ID, &a.UserID, &a.Name, &a.RepositoryURL, &a.ContainerPort, &a.Version, &created, &updated); err != nil {
+		return Application{}, err
+	}
+	a.CreatedAt = parseTime(created)
+	a.UpdatedAt = parseTime(updated)
+	return a, nil
+}
+
+// scanApplicationWithOwner is the JOIN variant used by the *ForCaller
+// service methods — also populates OwnerUsername so the admin's list
+// can render an "owner" column.
+func scanApplicationWithOwner(r rowScanner) (Application, error) {
+	var (
+		a       Application
+		created string
+		updated string
+	)
+	if err := r.Scan(&a.ID, &a.UserID, &a.OwnerUsername,
+		&a.Name, &a.RepositoryURL, &a.ContainerPort,
+		&a.Version, &created, &updated); err != nil {
 		return Application{}, err
 	}
 	a.CreatedAt = parseTime(created)

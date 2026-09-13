@@ -28,8 +28,12 @@ func NewHandler(svc *Service) *Handler { return &Handler{svc: svc} }
 // The dashboard uses it for the per-app badge and the Running/Failed
 // count cards (so they reflect reality, not the M3 placeholder).
 type ApplicationDTO struct {
-	ID            int64                `json:"id"`
-	UserID        int64                `json:"user_id"`
+	ID     int64 `json:"id"`
+	UserID int64 `json:"user_id"`
+	// OwnerUsername is populated by the admin-aware service methods so
+	// the Applications tab can show "alice / my-api" when an admin is
+	// viewing apps they don't own. Empty for normal user views.
+	OwnerUsername string               `json:"owner_username,omitempty"`
 	Name          string               `json:"name"`
 	RepositoryURL string               `json:"repository_url"`
 	ContainerPort int                  `json:"container_port"`
@@ -54,6 +58,7 @@ func toDTO(a Application) ApplicationDTO {
 	return ApplicationDTO{
 		ID:            a.ID,
 		UserID:        a.UserID,
+		OwnerUsername: a.OwnerUsername,
 		Name:          a.Name,
 		RepositoryURL: a.RepositoryURL,
 		ContainerPort: a.ContainerPort,
@@ -98,6 +103,17 @@ func callerUserID(r *http.Request) (int64, bool) {
 	return u.ID, true
 }
 
+// callerFromRequest returns the full Caller (id + admin flag) for
+// admin-aware service methods. Returns (_, false) when the session
+// middleware is not wired — handlers map that to 401.
+func callerFromRequest(r *http.Request) (Caller, bool) {
+	u, ok := auth.UserFromContext(r.Context())
+	if !ok || u == nil {
+		return Caller{}, false
+	}
+	return Caller{UserID: u.ID, IsAdmin: u.Role == auth.RoleAdmin}, true
+}
+
 // writeJSON / writeError are tiny shared helpers. Kept private to this
 // package so each handler package can evolve its error envelope without
 // affecting the others.
@@ -128,12 +144,12 @@ func mapErr(w http.ResponseWriter, err error) {
 
 // List handles GET /api/applications.
 func (h *Handler) List(w http.ResponseWriter, r *http.Request) {
-	uid, ok := callerUserID(r)
+	c, ok := callerFromRequest(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthenticated", "no session")
 		return
 	}
-	apps, err := h.svc.List(r.Context(), uid)
+	apps, err := h.svc.ListForCaller(r.Context(), c)
 	if err != nil {
 		writeError(w, http.StatusInternalServerError, "internal_error", "could not list applications")
 		return
@@ -195,7 +211,7 @@ func (h *Handler) Create(w http.ResponseWriter, r *http.Request) {
 
 // Get handles GET /api/applications/{id}.
 func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
-	uid, ok := callerUserID(r)
+	c, ok := callerFromRequest(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthenticated", "no session")
 		return
@@ -205,7 +221,7 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_id", "id must be an integer")
 		return
 	}
-	a, err := h.svc.Get(r.Context(), id, uid)
+	a, err := h.svc.GetForCaller(r.Context(), id, c)
 	if err != nil {
 		mapErr(w, err)
 		return
@@ -215,7 +231,7 @@ func (h *Handler) Get(w http.ResponseWriter, r *http.Request) {
 
 // Update handles PUT /api/applications/{id}.
 func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
-	uid, ok := callerUserID(r)
+	c, ok := callerFromRequest(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthenticated", "no session")
 		return
@@ -234,7 +250,8 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 		Name:          req.Name,
 		RepositoryURL: req.RepositoryURL,
 		ContainerPort: req.ContainerPort,
-		UserID:        uid,
+		UserID:        c.UserID,
+		IsAdmin:       c.IsAdmin,
 	})
 	if err != nil {
 		mapErr(w, err)
@@ -245,7 +262,7 @@ func (h *Handler) Update(w http.ResponseWriter, r *http.Request) {
 
 // Delete handles DELETE /api/applications/{id}.
 func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
-	uid, ok := callerUserID(r)
+	c, ok := callerFromRequest(r)
 	if !ok {
 		writeError(w, http.StatusUnauthorized, "unauthenticated", "no session")
 		return
@@ -255,7 +272,7 @@ func (h *Handler) Delete(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_id", "id must be an integer")
 		return
 	}
-	if err := h.svc.Delete(r.Context(), id, uid); err != nil {
+	if err := h.svc.DeleteForCaller(r.Context(), id, c); err != nil {
 		mapErr(w, err)
 		return
 	}

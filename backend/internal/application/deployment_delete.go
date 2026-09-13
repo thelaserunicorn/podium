@@ -43,6 +43,13 @@ import (
 //     stuck delete is not).
 //  4. Soft-delete the SQLite row.
 func (s *Service) DeleteDeployment(ctx context.Context, deploymentID, userID int64) error {
+	return s.DeleteDeploymentForCaller(ctx, deploymentID, Caller{UserID: userID, IsAdmin: false})
+}
+
+// DeleteDeploymentForCaller is the admin-aware variant of
+// DeleteDeployment. Admins can remove any deployment attempt from any
+// user's app.
+func (s *Service) DeleteDeploymentForCaller(ctx context.Context, deploymentID int64, c Caller) error {
 	if s.queries == nil {
 		return errors.New("application: queries not configured")
 	}
@@ -55,7 +62,7 @@ func (s *Service) DeleteDeployment(ctx context.Context, deploymentID, userID int
 		return fmt.Errorf("application: load deployment: %w", err)
 	}
 
-	app, err := s.Get(ctx, d.ApplicationID, userID)
+	app, err := s.GetForCaller(ctx, d.ApplicationID, c)
 	if err != nil {
 		if errors.Is(err, ErrNotFound) {
 			// Wrong owner — collapse into not-found to match the

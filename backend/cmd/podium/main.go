@@ -165,7 +165,7 @@ func run() error {
 		// would see a stale localhost URL pointing at a dead kubectl
 		// subprocess after deleting a deployment.
 		appSvc = appSvc.WithIngressEvicter(ingressRouter)
-		api.MountIngressURL(mux, api.NewIngressURLHandler(ingressRouter, logger))
+		api.MountIngressURL(mux, api.NewIngressURLHandler(ingressRouter, appSvc, logger))
 	} else {
 		logger.Warn("ingress disabled; /api/applications/{id}/ingress will return 502 until a Kubernetes cluster is reachable")
 	}

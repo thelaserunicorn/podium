@@ -81,7 +81,7 @@ func (h *K8sHandler) GetAppState(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_id", "id must be an integer")
 		return
 	}
-	app, err := h.apps.Get(r.Context(), appID, user.ID)
+	app, err := h.apps.GetForCaller(r.Context(), appID, caller(user))
 	if err != nil {
 		if errors.Is(err, application.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "not_found", "application not found")

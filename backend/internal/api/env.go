@@ -89,7 +89,7 @@ func (h *EnvHandler) List(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid application id")
 		return
 	}
-	app, err := h.apps.Get(r.Context(), appID, user.ID)
+	app, err := h.apps.GetForCaller(r.Context(), appID, caller(user))
 	if err != nil {
 		if errors.Is(err, application.ErrNotFound) {
 			writeJSONError(w, http.StatusNotFound, "application not found")
@@ -138,7 +138,7 @@ func (h *EnvHandler) Set(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid application id")
 		return
 	}
-	app, err := h.apps.Get(r.Context(), appID, user.ID)
+	app, err := h.apps.GetForCaller(r.Context(), appID, caller(user))
 	if err != nil {
 		if errors.Is(err, application.ErrNotFound) {
 			writeJSONError(w, http.StatusNotFound, "application not found")
@@ -198,7 +198,7 @@ func (h *EnvHandler) Delete(w http.ResponseWriter, r *http.Request) {
 		writeJSONError(w, http.StatusBadRequest, "invalid application id")
 		return
 	}
-	app, err := h.apps.Get(r.Context(), appID, user.ID)
+	app, err := h.apps.GetForCaller(r.Context(), appID, caller(user))
 	if err != nil {
 		if errors.Is(err, application.ErrNotFound) {
 			writeJSONError(w, http.StatusNotFound, "application not found")

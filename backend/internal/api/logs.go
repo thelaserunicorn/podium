@@ -67,7 +67,7 @@ func (h *LogsHandler) GetAppLogs(w http.ResponseWriter, r *http.Request) {
 		writeError(w, http.StatusBadRequest, "invalid_id", "id must be an integer")
 		return
 	}
-	if _, err := h.apps.Get(r.Context(), appID, user.ID); err != nil {
+	if _, err := h.apps.GetForCaller(r.Context(), appID, caller(user)); err != nil {
 		if errors.Is(err, application.ErrNotFound) {
 			writeError(w, http.StatusNotFound, "not_found", "application not found")
 			return
@@ -140,7 +140,7 @@ func (h *LogsHandler) GetDeploymentEvents(w http.ResponseWriter, r *http.Request
 		writeError(w, http.StatusInternalServerError, "internal_error", "")
 		return
 	}
-	if _, err := h.apps.Get(r.Context(), d.ApplicationID, user.ID); err != nil {
+	if _, err := h.apps.GetForCaller(r.Context(), d.ApplicationID, caller(user)); err != nil {
 		// Cross-user lookup — same response as 404 (AGENTS.md §19).
 		writeError(w, http.StatusNotFound, "not_found", "deployment not found")
 		return

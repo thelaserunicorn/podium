@@ -8,6 +8,7 @@ import (
 	"net/http"
 	"strconv"
 
+	"github.com/podium/podium/internal/application"
 	"github.com/podium/podium/internal/auth"
 	"github.com/podium/podium/internal/ingress"
 )
@@ -38,14 +39,15 @@ type ingressURLResponse struct {
 // across requests would re-create the subprocess each time.
 type IngressURLHandler struct {
 	router *ingress.Router
+	apps   *application.Service
 	logger *slog.Logger
 }
 
-func NewIngressURLHandler(router *ingress.Router, logger *slog.Logger) *IngressURLHandler {
+func NewIngressURLHandler(router *ingress.Router, apps *application.Service, logger *slog.Logger) *IngressURLHandler {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &IngressURLHandler{router: router, logger: logger}
+	return &IngressURLHandler{router: router, apps: apps, logger: logger}
 }
 
 // ServeHTTP implements http.Handler.
@@ -80,7 +82,18 @@ func (h *IngressURLHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	fwd, err := h.router.Lookup(r.Context(), appID, ns, user.ID)
+	app, err := h.apps.GetForCaller(r.Context(), appID, caller(user))
+	if err != nil {
+		if errors.Is(err, application.ErrNotFound) {
+			http.Error(w, `{"error":"application not found"}`, http.StatusNotFound)
+			return
+		}
+		h.logger.Error("ingress: load application", slog.Int64("app_id", appID), slog.String("err", err.Error()))
+		http.Error(w, `{"error":"internal_error"}`, http.StatusInternalServerError)
+		return
+	}
+
+	fwd, err := h.router.Lookup(r.Context(), appID, ns, app.UserID)
 	if err != nil {
 		switch {
 		case errors.Is(err, ingress.ErrNoSuchApp):
